@@ -55,25 +55,12 @@ const LED_INDICATOR_TEENSY_PIN: u8 = parse_u8(env!("LED_INDICATOR_PIN"));
 const LED_A_TEENSY_PIN: u8 = parse_u8(env!("BASE_LED_A_PIN"));
 const LED_B_TEENSY_PIN: u8 = parse_u8(env!("BASE_LED_B_PIN"));
 const BLINK_HZ: u32 = parse_u32(env!("BASE_LED_BLINK_HZ"));
-const W5500_SPI_HZ: u32 = parse_u32(env!("W5500_SPI_HZ"));
-const W5500_RESET_TEENSY_PIN: u8 = parse_u8(env!("W5500_RESET_PIN"));
-const W5500_INT_TEENSY_PIN: u8 = parse_u8(env!("W5500_INT_PIN"));
 const LED_SWAP_PERIOD_MS: u32 = 1_000 / (BLINK_HZ * 2);
-const W5500_POLL_PERIOD_MS: u32 = 1_000;
 /// Lines in the one-time boot banner emitted once per USB attach.
 const BOOT_BANNER_LINES: u8 = 2;
 const BOARD: TeensyBoard = TeensyBoard::Teensy41;
 /// Source MAC for EtherCAT frames (locally-administered; slaves ignore it).
 const ECAT_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
-
-const _: () = {
-    if W5500_RESET_TEENSY_PIN != 40 {
-        panic!("W5500 reset pin must be Teensy pin 40");
-    }
-    if W5500_INT_TEENSY_PIN != 41 {
-        panic!("W5500 interrupt pin must be Teensy pin 41");
-    }
-};
 
 static USB_ENDPOINT_MEMORY: imxrt_usbd::EndpointMemory<USB_ENDPOINT_BYTES> =
     imxrt_usbd::EndpointMemory::new();
@@ -234,10 +221,6 @@ fn configure_led_pad(teensy_pin: u8) {
             _ => panic!("unsupported base LED pin"),
         }
     }
-}
-
-fn delay_cycles_from_us(us: u32) {
-    cortex_m::asm::delay((board::clock_config::CORE_CLOCK_HZ / 1_000_000) * us);
 }
 
 fn drive_bootloader_safe_outputs() {
@@ -783,6 +766,13 @@ mod app {
         unsafe { init_usb(usb) };
         boot_stage(&mut indicator, &mut led_a, &mut led_b, 2); // USB peripheral configured
         log::info!("[boot] {} {} ({})", FW_NAME, FW_VERSION, FW_TAG);
+        log::info!(
+            "[boot] core {} Hz (req {}), IPG {} Hz, VDD_SOC {} mV",
+            board::clock_config::CORE_CLOCK_HZ,
+            board::clock_config::PROFILE.requested_hz,
+            board::clock_config::PROFILE.ipg_hz,
+            board::clock_config::PROFILE.vdd_soc_mv,
+        );
 
         // ── EtherCAT ENET bring-up (raw Layer-2 transport; RMII only) ──
         unsafe { net::ethernet::setup_clocks_and_pins(&mut gpio2) };

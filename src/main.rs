@@ -6,7 +6,6 @@
 mod board;
 mod ethercat;
 mod hal;
-mod modbus;
 mod net;
 
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -14,7 +13,6 @@ use core::{cell::UnsafeCell, fmt::Write as _, mem::MaybeUninit};
 use board::fast_gpio::FastGpioOutput;
 use board::teensy_pin_map::{teensy_pin_to_fast_gpio, FastGpio, TeensyBoard};
 use imxrt_ral as ral;
-use modbus::modbus_slave::ModbusSlave;
 use panic_halt as _;
 use ral::iomuxc;
 use rtic_monotonics::systick::prelude::*;
@@ -28,7 +26,6 @@ use usb_device::{
     UsbDirection,
 };
 use usbd_serial::CdcAcmClass;
-use net::w5500_spi::{W5500Config, W5500Interface, W5500Status};
 use net::enet_driver::EnetDevice;
 use net::enet_ring::{RxDT, TxDT};
 use ethercat::cli;
@@ -87,9 +84,6 @@ type UsbAllocator = UsbBusAllocator<UsbBus>;
 type UsbMonitor = board::usb_bootloader::Monitor<UsbBus>;
 type UsbSerial = CdcAcmClass<'static, UsbBus>;
 type UsbDeviceInstance = UsbDevice<'static, UsbBus>;
-type W5500Spi = bsp::board::Lpspi4;
-type W5500Reset = bsp::hal::gpio::Output<teensy4_bsp::pins::t41::P40>;
-type W5500Interrupt = bsp::hal::gpio::Input<teensy4_bsp::pins::t41::P41>;
 type EcatMaster = Master<'static>;
 
 /// `Send` wrapper so the master can live in an RTIC resource. The master holds
@@ -702,14 +696,28 @@ impl<T> Singleton<T> {
     }
 }
 
+/// Show a boot-progress code on the 3 LEDs (indicator=pin13 as bit2,
+/// led_a=pin4 as bit1, led_b=pin5 as bit0) and hold it briefly so it can be
+/// read by eye. If boot hangs, the final frozen code marks the last `init`
+/// stage reached -- our only window without USB or SWD.
+fn boot_stage(
+    indicator: &mut FastGpioOutput,
+    led_a: &mut FastGpioOutput,
+    led_b: &mut FastGpioOutput,
+    code: u8,
+) {
+    indicator.write(code & 0b100 != 0);
+    led_a.write(code & 0b010 != 0);
+    led_b.write(code & 0b001 != 0);
+    cortex_m::asm::delay(board::clock_config::CORE_CLOCK_HZ / 3); // ~330 ms
+}
+
 #[rtic::app(device = teensy4_bsp, dispatchers = [GPIO6_7_8_9, LPUART8, GPT1])]
 mod app {
     use super::*;
 
     #[shared]
     struct Shared {
-        modbus: ModbusSlave,
-        w5500_status: W5500Status,
         ecat_scan: EcatScan,
         ecat_cmd: Option<cli::Command>,
         ecat_out: EcatOut,
@@ -726,10 +734,6 @@ mod app {
         scan_announced: bool,
         led_a: FastGpioOutput,
         led_b: FastGpioOutput,
-        w5500: W5500Interface,
-        lpspi4: W5500Spi,
-        w5500_reset: W5500Reset,
-        w5500_int: W5500Interrupt,
         ecat_line: heapless::String<128>,
     }
 
@@ -750,114 +754,59 @@ mod app {
         board::clock_config::flash_indicator(&mut indicator);
 
         let bsp::board::Resources {
-            pins,
             usb,
-            lpspi4,
-            mut gpio1,
             mut gpio2,
             ..
         } = bsp::board::t41(instances);
 
         let led_a_gpio = led_fast_gpio(LED_A_TEENSY_PIN);
         configure_led_pad(LED_A_TEENSY_PIN);
-        let led_a = FastGpioOutput::new(led_a_gpio);
+        let mut led_a = FastGpioOutput::new(led_a_gpio);
         unsafe {
             led_a.init();
         }
 
         let led_b_gpio = led_fast_gpio(LED_B_TEENSY_PIN);
         configure_led_pad(LED_B_TEENSY_PIN);
-        let led_b = FastGpioOutput::new(led_b_gpio);
+        let mut led_b = FastGpioOutput::new(led_b_gpio);
         unsafe {
             led_b.init();
         }
 
         Mono::start(cx.core.SYST, board::clock_config::CORE_CLOCK_HZ);
-        blink_leds::spawn().ok();
 
-        let mut modbus = ModbusSlave::new();
-        modbus.load_register_map(modbus::register_map::USER_REGISTERS);
-        let w5500_config = W5500Config::from_network(modbus.network_config());
-        let mut w5500 = W5500Interface::new(w5500_config);
-
-        let w5500_reset = gpio1.output(pins.p40);
-        let w5500_int = gpio1.input(pins.p41);
-        w5500_reset.clear();
-        delay_cycles_from_us(500);
-        w5500_reset.set();
-        // W5500 RSTn is active-low; keep the owned output high after reset.
-        delay_cycles_from_us(20_000);
-
-        let mut lpspi4: W5500Spi = bsp::board::lpspi(
-            lpspi4,
-            bsp::board::LpspiPins {
-                sdo: pins.p11,
-                sdi: pins.p12,
-                sck: pins.p13,
-                pcs0: pins.p10,
-            },
-            W5500_SPI_HZ,
-        );
-
-        let mut w5500_status = match w5500.bring_up(&mut lpspi4) {
-            Ok(status) => status,
-            Err(_) => W5500Status::spi_error(),
-        };
-        w5500_status.interrupt_asserted = !w5500_int.is_set();
+        // Stage 1: clocks + LEDs + monotonic up. (RMII-only firmware: the legacy
+        // W5500 SPI / Modbus path is NOT brought up -- it would hang here on a
+        // board with no W5500 chip, and its SCK shares the pin-13 LED.)
+        boot_stage(&mut indicator, &mut led_a, &mut led_b, 1);
 
         unsafe { init_usb(usb) };
+        boot_stage(&mut indicator, &mut led_a, &mut led_b, 2); // USB peripheral configured
         log::info!("[boot] {} {} ({})", FW_NAME, FW_VERSION, FW_TAG);
-        log::info!(
-            "[boot] clock indicator Teensy pin {}",
-            LED_INDICATOR_TEENSY_PIN,
-        );
-        log::info!(
-            "[boot] blinking Teensy pins {} and {} at {} Hz on {} Hz core",
-            LED_A_TEENSY_PIN,
-            LED_B_TEENSY_PIN,
-            BLINK_HZ,
-            board::clock_config::CORE_CLOCK_HZ,
-        );
-        log::info!(
-            "[boot] requested {} Hz core, IPG bus {} Hz, VDD_SOC {} mV",
-            board::clock_config::PROFILE.requested_hz,
-            board::clock_config::PROFILE.ipg_hz,
-            board::clock_config::PROFILE.vdd_soc_mv,
-        );
-        log::info!(
-            "[boot] W5500 LPSPI4 {} Hz, RSTn pin {}, INTn pin {}",
-            W5500_SPI_HZ,
-            W5500_RESET_TEENSY_PIN,
-            W5500_INT_TEENSY_PIN,
-        );
-        // W5500 network connection disabled: the Teensy 4.1 built-in RMII ENET
-        // will be the EtherCAT transport. The chip is still brought up and
-        // reported above, but the Modbus-TCP-over-W5500 poller is not started.
-        // Re-enable by restoring: poll_w5500::spawn().ok();
 
-        // ── EtherCAT ENET bring-up (raw Layer-2 transport for the master) ──
-        // The built-in RMII ENET carries EtherCAT frames; the master is built
-        // over it and a one-shot task performs the bus scan once link is up.
+        // ── EtherCAT ENET bring-up (raw Layer-2 transport; RMII only) ──
         unsafe { net::ethernet::setup_clocks_and_pins(&mut gpio2) };
+        boot_stage(&mut indicator, &mut led_a, &mut led_b, 3); // ENET clocks/pads/PHY reset
         let ecat_rxdt = unsafe { ECAT_RXDT.write(RxDT::default()) };
         let ecat_txdt = unsafe { ECAT_TXDT.write(TxDT::default()) };
         let enet_inst = unsafe { ral::enet::ENET1::instance() };
         let mut ecat_enet = EnetDevice::new(enet_inst, ecat_rxdt, ecat_txdt);
+        boot_stage(&mut indicator, &mut led_a, &mut led_b, 4); // ENET MAC/DMA up
         net::ethernet::setup_phy(&mut ecat_enet);
+        boot_stage(&mut indicator, &mut led_a, &mut led_b, 5); // PHY MDIO configured
         let ecat_master = Master::new(Device::new(ecat_enet, ECAT_MAC));
+        boot_stage(&mut indicator, &mut led_a, &mut led_b, 6); // master built; init complete
         log::info!("[ecat] ENET initialised; scheduling bus scan");
 
-        // The PIT cyclic-tick timer is configured lazily by the `start` command
-        // (see ecat_run_command), NOT here. This keeps `init` identical to the
-        // known-good boot path so the board always enumerates USB / the CLI,
-        // and isolates any PIT/clock setup risk to a deliberate `start`.
+        // The PIT cyclic-tick timer is configured lazily by the `start` command.
 
+        // After init returns, blink_leds takes over pins 4/5 (alternating
+        // heartbeat) = "init complete, tasks running".
+        blink_leds::spawn().ok();
         ethercat_worker::spawn().ok();
 
         (
             Shared {
-                modbus,
-                w5500_status,
                 ecat_scan: EcatScan::new(),
                 ecat_cmd: None,
                 ecat_out: EcatOut::new(),
@@ -870,10 +819,6 @@ mod app {
                 scan_announced: false,
                 led_a,
                 led_b,
-                w5500,
-                lpspi4,
-                w5500_reset,
-                w5500_int,
                 ecat_line: heapless::String::new(),
             },
         )
@@ -889,41 +834,6 @@ mod app {
             cx.local.led_a.write(false);
             cx.local.led_b.write(true);
             Mono::delay(LED_SWAP_PERIOD_MS.millis()).await;
-        }
-    }
-
-    #[task(
-        shared = [modbus, w5500_status],
-        local = [lpspi4, w5500, w5500_reset, w5500_int],
-        priority = 1
-    )]
-    async fn poll_w5500(mut cx: poll_w5500::Context) {
-        loop {
-            cx.local.w5500_reset.set();
-            cx.shared.modbus.lock(|modbus| {
-                let _ = cx.local.w5500.poll_modbus_tcp(cx.local.lpspi4, modbus);
-            });
-            let mut status = match W5500Interface::read_status(cx.local.lpspi4) {
-                Ok(status) => status,
-                Err(_) => W5500Status::spi_error(),
-            };
-            if status.chip_detected
-                && status.socket0_status != net::w5500_spi::SOCKET_STATUS_LISTEN
-                && status.socket0_status != net::w5500_spi::SOCKET_STATUS_ESTABLISHED
-            {
-                let _ = W5500Interface::ensure_modbus_listener(
-                    cx.local.lpspi4,
-                    net::w5500_spi::MODBUS_TCP_PORT,
-                );
-                status = match W5500Interface::read_status(cx.local.lpspi4) {
-                    Ok(status) => status,
-                    Err(_) => W5500Status::spi_error(),
-                };
-            }
-            status.interrupt_asserted = !cx.local.w5500_int.is_set();
-            cx.shared.w5500_status.lock(|stored| *stored = status);
-            cortex_m::peripheral::NVIC::pend(teensy4_bsp::Interrupt::USB_OTG1);
-            Mono::delay(W5500_POLL_PERIOD_MS.millis()).await;
         }
     }
 

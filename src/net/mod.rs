@@ -1,9 +1,7 @@
-//! Link layer: network controllers and frame transport.
-//!
-//! Houses the Teensy 4.1 built-in RMII ENET driver (vendored `rt1062-eth-rs`:
-//! `enet_driver`, `enet_ring`, `ethernet`, `boot_diag`) which will carry raw
-//! EtherCAT Layer-2 frames, plus the legacy `w5500_spi` controller (kept in the
-//! tree but with its network connection disabled).
+//! Link layer: the Teensy 4.1 built-in RMII ENET driver (vendored
+//! `rt1062-eth-rs`: `enet_driver`, `enet_ring`, `ethernet`, `boot_diag`) that
+//! carries the raw EtherCAT Layer-2 frames. RMII-only: the legacy W5500 SPI
+//! controller and the Modbus stack have been dropped from this firmware.
 
 #[allow(dead_code)]
 pub mod boot_diag;
@@ -13,4 +11,3 @@ pub mod enet_driver;
 pub mod enet_ring;
 #[allow(dead_code)]
 pub mod ethernet;
-pub mod w5500_spi;

@@ -1,0 +1,65 @@
+[package]
+name = "teensy-rust-modbus-base"
+version = "0.1.0"
+edition = "2021"
+authors = ["Griffin Sisk"]
+description = "Generic Teensy 4.1 Rust foundation for Modbus devices"
+
+[dependencies]
+# Board support
+teensy4-bsp = { version = "0.5", features = ["rt"] }
+teensy4-pins = "0.3"
+
+# HAL + register access
+imxrt-hal = "0.5"
+imxrt-ral = "0.5"
+
+# RTIC 2.x framework
+rtic = { version = "2", features = ["thumbv7-backend"] }
+rtic-monotonics = { version = "2", features = ["cortex-m-systick"] }
+
+# Modbus protocol (no_std)
+rmodbus = { version = "0.12", default-features = false }
+
+# RMII ENET driver (vendored rt1062-eth-rs). smoltcp is only pulled in by the
+# vendored driver's phy::Device impl; it will be dropped when the EtherCAT
+# master moves to raw Layer-2 frames.
+smoltcp = { version = "0.10", default-features = false, features = [
+    "medium-ethernet",
+    "proto-ipv4",
+    "socket-tcp",
+    "socket-raw",
+] }
+struct-pad = "0.2"
+static_assertions = "1.1"
+
+# Cortex-M
+cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
+cortex-m-rt = "0.7"
+
+# Logging facade
+log = "0.4"
+
+# USB CDC device runtime
+imxrt-usbd = "0.2"
+usb-device = "0.2.9"
+usbd-serial = "0.1.1"
+
+# Panic handler
+panic-halt = "1"
+
+# W5500 SPI foundation and small fixed-capacity buffers
+embedded-hal = "1.0"
+embedded-hal-02 = { package = "embedded-hal", version = "0.2.7" }
+fugit = "0.3"
+heapless = "0.8"
+critical-section = "1.2"
+
+[profile.release]
+opt-level = "s"
+lto = true
+debug = true
+codegen-units = 1
+
+[profile.dev]
+opt-level = 1

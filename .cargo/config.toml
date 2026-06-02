@@ -1,0 +1,29 @@
+[target.thumbv7em-none-eabihf]
+rustflags = [
+    "-C", "link-arg=-Tt4link.x",
+    # Teensy 4.x uses the NXP i.MX RT1062's Cortex-M7 core, not a generic ARMv7E-M CPU.
+    "-C", "target-cpu=cortex-m7",
+]
+
+[build]
+target = "thumbv7em-none-eabihf"
+
+[env]
+# Supported profiles: 24000000, 150000000, 396000000, 450000000,
+# 528000000, 600000000, 720000000, 816000000, 912000000,
+# 960000000, 1008000000.
+TEENSY4_CORE_CLOCK_HZ = "600000000"
+# Must be "true" to use profiles above 600 MHz. Overclock profiles need
+# board-level cooling and peripheral timing validation.
+TEENSY4_ALLOW_OVERCLOCK = "true"
+# Must also be "true" for profiles whose requested voltage reaches the DCDC max.
+TEENSY4_ALLOW_MAX_VOLTAGE = "false"
+LED_INDICATOR_PIN = "13"
+BASE_LED_A_PIN = "4"
+BASE_LED_B_PIN = "5"
+BASE_LED_BLINK_HZ = "2"
+W5500_SPI_HZ = "1000000"
+W5500_RESET_PIN = "40"
+W5500_INT_PIN = "41"
+
+

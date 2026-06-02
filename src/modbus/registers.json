@@ -1,0 +1,19 @@
+{
+  "registers": [
+    {"address": "0x0000", "name": "ip_octet_1", "default": 10, "saveable": true},
+    {"address": "0x0002", "name": "ip_octet_2", "default": 0, "saveable": true},
+    {"address": "0x0004", "name": "ip_octet_3", "default": 0, "saveable": true},
+    {"address": "0x0006", "name": "ip_octet_4", "default": 55, "saveable": true},
+    {"address": "0x0008", "name": "subnet_octet_1", "default": 255, "saveable": true},
+    {"address": "0x000A", "name": "subnet_octet_2", "default": 255, "saveable": true},
+    {"address": "0x000C", "name": "subnet_octet_3", "default": 255, "saveable": true},
+    {"address": "0x000E", "name": "subnet_octet_4", "default": 0, "saveable": true},
+    {"address": "0x0010", "name": "gateway_octet_1", "default": 10, "saveable": true},
+    {"address": "0x0012", "name": "gateway_octet_2", "default": 0, "saveable": true},
+    {"address": "0x0014", "name": "gateway_octet_3", "default": 0, "saveable": true},
+    {"address": "0x0016", "name": "gateway_octet_4", "default": 1, "saveable": true},
+    {"address": "0x0018", "name": "apply_network", "default": 0, "saveable": false},
+    {"address": "0x0020", "name": "modbus_unit_id", "default": 1, "saveable": true},
+    {"address": "0x0022", "name": "status", "default": 0, "saveable": false}
+  ]
+}

@@ -1,0 +1,19 @@
+# Rust build artifacts
+/target/
+
+# Backup files
+**/*.rs.bk
+
+# macOS
+.DS_Store
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+
+# Python (scripts/tools)
+__pycache__/
+*.py[cod]
+.venv/
+venv/

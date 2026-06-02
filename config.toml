@@ -1,0 +1,2 @@
+# Cargo reads `.cargo/config.toml` for this project.
+# Keep compile flags and firmware environment config there.

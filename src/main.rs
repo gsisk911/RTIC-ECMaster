@@ -977,51 +977,12 @@ mod app {
             Mono::delay(50_u32.millis()).await;
         }
 
-        // Wait (bounded) for the PHY link before the initial bus scan.
-        let mut linked = false;
-        for _ in 0..50 {
-            if cx.shared.ecat_master.lock(|m| m.0.link_up()) {
-                linked = true;
-                break;
-            }
-            Mono::delay(100_u32.millis()).await;
-        }
-        if !linked {
-            log::warn!("[ecat] PHY link not up; attempting scan anyway");
-        }
-
-        // Initial bus scan (blocking; the PIT is not yet running, so holding the
-        // master lock here only briefly delays USB).
-        let scan = cx.shared.ecat_master.lock(|m| {
-            let result = m.0.scan();
-            let mut snapshot: heapless::Vec<SlaveInfo, EC_MAX_SLAVES> = heapless::Vec::new();
-            if result.is_ok() {
-                for slave in m.0.slaves() {
-                    let _ = snapshot.push(*slave);
-                }
-            }
-            (result, snapshot)
-        });
-        match scan {
-            (Ok(n), snapshot) => {
-                log::info!("[ecat] scan complete: {} slave(s)", n);
-                cx.shared.ecat_scan.lock(|state| {
-                    state.slaves = snapshot;
-                    state.failed = false;
-                    state.done = true;
-                });
-            }
-            (Err(e), _) => {
-                log::warn!("[ecat] bus scan failed: {:?}", e);
-                cx.shared.ecat_scan.lock(|state| {
-                    state.slaves.clear();
-                    state.failed = true;
-                    state.done = true;
-                });
-            }
-        }
-
-        // Nudge the USB reporter so the one-time scan summary flushes promptly.
+        // Cooperative ("round-robin") boot: do NOT auto-scan the bus here. The
+        // bus scan is a blocking busy-wait that monopolizes the priority-1
+        // executor and holds the master lock (whose ceiling, raised by the
+        // priority-3 cyclic task, masks usb_isr) -- that froze blink_leds and
+        // the USB CLI. The scan now runs only on demand via `rescan` (and as the
+        // first step of `start`), once the operator confirms the network.
         cortex_m::peripheral::NVIC::pend(teensy4_bsp::Interrupt::USB_OTG1);
 
         // Command loop: take a parsed command, drive it (locking the master per

@@ -9,6 +9,7 @@ mod hal;
 mod modbus;
 mod net;
 
+use core::sync::atomic::{AtomicBool, Ordering};
 use core::{cell::UnsafeCell, fmt::Write as _, mem::MaybeUninit};
 use board::fast_gpio::FastGpioOutput;
 use board::teensy_pin_map::{teensy_pin_to_fast_gpio, FastGpio, TeensyBoard};
@@ -166,6 +167,12 @@ impl EcatOut {
         self.cursor = (self.cursor + n).min(self.buf.len());
     }
 }
+
+/// Set true by `usb_isr` once the USB device is configured. The EtherCAT worker
+/// waits on this before touching the (shared) master, so the master lock --
+/// whose priority ceiling is raised by the cyclic PIT task and masks `usb_isr`
+/// -- never stalls USB enumeration during the blocking boot scan.
+static USB_READY: AtomicBool = AtomicBool::new(false);
 
 static USB_BUS: Singleton<UsbAllocator> = Singleton::uninit();
 static USB_MONITOR: Singleton<UsbMonitor> = Singleton::uninit();
@@ -935,6 +942,9 @@ mod app {
     fn usb_isr(mut cx: usb_isr::Context) {
         let usb_ready = unsafe { poll_usb(cx.local.usb_configured) };
         if usb_ready {
+            USB_READY.store(true, Ordering::Relaxed);
+        }
+        if usb_ready {
             let serial = unsafe { USB_SERIAL.assume_init_mut() };
 
             // 1) Drain typed input. Build the current line and, on a newline,
@@ -1046,6 +1056,17 @@ mod app {
 
     #[task(shared = [ecat_scan, ecat_cmd, ecat_out, ecat_master], priority = 1)]
     async fn ethercat_worker(mut cx: ethercat_worker::Context) {
+        // Let USB enumerate before touching the (shared) master. The master
+        // lock's ceiling is raised to the cyclic PIT task's priority (3), which
+        // masks usb_isr (2); holding it across the blocking boot scan would
+        // otherwise stall enumeration. Bounded so we proceed even with no host.
+        for _ in 0..200 {
+            if USB_READY.load(Ordering::Relaxed) {
+                break;
+            }
+            Mono::delay(50_u32.millis()).await;
+        }
+
         // Wait (bounded) for the PHY link before the initial bus scan.
         let mut linked = false;
         for _ in 0..50 {

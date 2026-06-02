@@ -634,6 +634,8 @@ async fn ecat_run_command<M: Mutex<T = EcatMasterCell>>(
         }
         cli::Command::Start { slave } => match ecat_drive(master, Request::StartCyclic { slave }).await {
             Ok(Outcome::CyclicStarted) => {
+                // Configure + start the PIT only now (deliberate action), not at boot.
+                board::cycle_timer::configure(ethercat::config::generated::BUS.cycle_ns);
                 board::cycle_timer::start();
                 resp_push(
                     &mut out,
@@ -838,16 +840,10 @@ mod app {
         let ecat_master = Master::new(Device::new(ecat_enet, ECAT_MAC));
         log::info!("[ecat] ENET initialised; scheduling bus scan");
 
-        // Configure the PIT cyclic-tick timer (stopped until `start`). Period
-        // comes from the compile-time bus config; the engine is 4 kHz-capable.
-        let cycle_ns = ethercat::config::generated::BUS.cycle_ns;
-        let load = board::cycle_timer::configure(cycle_ns);
-        log::info!(
-            "[ecat] cyclic timer: {} ns/cycle ({} Hz), PIT load {}",
-            cycle_ns,
-            1_000_000_000u64 / cycle_ns.max(1),
-            load,
-        );
+        // The PIT cyclic-tick timer is configured lazily by the `start` command
+        // (see ecat_run_command), NOT here. This keeps `init` identical to the
+        // known-good boot path so the board always enumerates USB / the CLI,
+        // and isolates any PIT/clock setup risk to a deliberate `start`.
 
         ethercat_worker::spawn().ok();
 

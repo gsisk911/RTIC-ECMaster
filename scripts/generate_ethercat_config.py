@@ -187,6 +187,14 @@ def resolve(cycle_ns, ref_clock, slaves, esi):
         sms = esi.get(s["pid"])
         if sms is None:
             raise SystemExit(f"product 0x{s['pid']:04X} not found in ESI")
+        # Process data lives in SM2/SM3, so the device must declare >= 4 SMs.
+        # Guard explicitly so a mismatched second-slave ESI fails with a clear
+        # message instead of an IndexError.
+        if len(sms) < 4:
+            raise SystemExit(
+                f"slave {s['position']} product 0x{s['pid']:04X}: ESI declares "
+                f"{len(sms)} sync manager(s), need >= 4 (SM0..SM3)"
+            )
         # ESI SM order is SM0, SM1, SM2, SM3, ...; index directly.
         s["sm_phys"] = {2: sms[2][0], 3: sms[3][0]}
         s["sm_ctrl"] = {2: sms[2][1], 3: sms[3][1]}
@@ -240,6 +248,20 @@ def resolve(cycle_ns, ref_clock, slaves, esi):
                     bit_acc += bits
         out_cursor += s["out_size"]
         in_cursor += s["in_size"]
+
+    # Pin names index the process image globally, so they MUST be unique across
+    # all slaves (BUS.pin() / the HAL / CiA-402 drive discovery resolve by name).
+    # With a multi-slave bus the lcec convention namespaces them per slave
+    # (drive0-*, drive1-*); catch a missing prefix at generate time rather than
+    # let a duplicate silently alias to the first slave's offset.
+    seen_pins = set()
+    for p in pins:
+        if p["name"] in seen_pins:
+            raise SystemExit(
+                f"duplicate halPin name '{p['name']}'; namespace pins per slave "
+                f"(e.g. drive0-*, drive1-*)"
+            )
+        seen_pins.add(p["name"])
 
     stream_sample_bytes = sample_off
     leads = [s["motion_lead"] for s in slaves if s["motion_lead"] > 0]

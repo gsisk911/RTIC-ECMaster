@@ -68,3 +68,23 @@ pub fn clear_interrupt() {
     let pit = unsafe { ral::pit::PIT::instance() };
     ral::write_reg!(ral::pit::timer, &pit.TIMER[0], TFLG, TIF: 1);
 }
+
+/// Absolute interrupt latency since the hardware fire, in PIT ticks (perclk).
+///
+/// Reads the channel's current down-counter (CVAL) against its load value
+/// (LDVAL): the channel reloads `LDVAL` at the fire and counts down, so at
+/// handler entry `LDVAL - CVAL` is the time from the fire to the ISR actually
+/// running. Its spread across cycles IS the scheduling jitter: it stays
+/// ~constant (the WFI wake + dispatch floor) while the core idles at fire time,
+/// and grows whenever a lower-priority section (e.g. the worker holding the
+/// master lock, which masks the cyclic IRQ via its priority ceiling) defers
+/// entry. Saturating so a same-instant reload race can never underflow. Assumes
+/// latency < one period (an overrun would alias; that case is surfaced
+/// separately by the cycle/WKC counters).
+#[inline]
+pub fn latency_ticks() -> u32 {
+    let pit = unsafe { ral::pit::PIT::instance() };
+    let ldval = ral::read_reg!(ral::pit::timer, &pit.TIMER[0], LDVAL);
+    let cval = ral::read_reg!(ral::pit::timer, &pit.TIMER[0], CVAL);
+    ldval.saturating_sub(cval)
+}

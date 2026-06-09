@@ -362,6 +362,10 @@ impl ScanFsm {
     ) -> Result<ScanStep, EcError> {
         if self.tx_len == 0 {
             let i = alloc_index(index);
+            // Scan reads are tiny (AL status = 2 B, DL info = 12 B); the fixed
+            // zero buffer bounds the read payload. Keep `read_len <= 12` for any
+            // new scan field, or widen `zeros` to match.
+            debug_assert!(read_len <= 12, "scan read_len exceeds the zero buffer");
             let zeros = [0u8; 12];
             self.tx_len = datagram::build(&mut self.tx, i, cmd, adp, ado, &zeros[..read_len]);
             self.pump.reset();

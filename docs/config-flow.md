@@ -25,7 +25,10 @@ hand-edit it.
 This is the source of truth for *what you want the bus to do*: the master cycle,
 each slave's vendor/product, the Distributed-Clocks config, SDO init values, and
 the sync-manager → PDO → entry mapping with `halPin` names. It is the LinuxCNC
-"lcec" dialect (the same dialect as a plain `ethercat-conf.xml`).
+"lcec" dialect (the same dialect as a plain `ethercat-conf.xml`). The committed
+file defines **two** identical drives (`drive0` / `drive1`, ring positions 0 and
+1); the excerpt below shows the first — the second is identical apart from its
+`idx` and its `drive1-` pin namespace (pin names must be unique across the bus).
 
 ```xml
 <masters>
@@ -96,16 +99,26 @@ Stdlib only (`xml.etree.ElementTree`). It:
    init list, and the out/in sync managers with their PDOs and entries.
 3. For each slave, matches the ESI device by `pid` and pulls **SM2/SM3** physical
    start + control byte (it indexes the ESI SM list directly as `sms[2]`,
-   `sms[3]`).
+   `sms[3]`). Process data lives in SM2/SM3, so the device **must declare at least
+   4 sync managers** (SM0..SM3) — a mismatched (e.g. second-slave) ESI fails with a
+   clear message instead of an `IndexError`.
 4. Computes the process-image layout: **all outputs first, then all inputs**.
    Each slave's output region is appended at the running output cursor and its
    input region at the running input cursor (which starts after all outputs).
    Each entry's `(byte_offset, bit_position)` is the SM's logical base plus the
    accumulated preceding-entry bits.
 5. Validates each SDO-init payload fits an expedited transfer (≤ 4 bytes) — it
-   **errors out** otherwise.
+   **errors out** otherwise. Also validates **pin-name uniqueness**: pin names
+   index the process image globally, so a duplicate `halPin` across slaves is
+   rejected at generate time — namespace pins per slave (`drive0-*`, `drive1-*`)
+   rather than let a duplicate silently alias the first slave's offset.
 6. Renders `generated.rs`: the per-slave `SmCfg`/`FmmuCfg`/`SdoInit`/`DcCfg`
    tables, the `SLAVES` array, the `PINS` array, and the top-level `BUS`.
+7. Emits the **host-bridge layout** for the Pi/LinuxCNC SPI bridge from the same
+   pass: `src/hal/spi_layout_generated.rs` (the streamed-motion field table) and
+   `linuxcnc/teensy_bridge_layout.h` (the Pi HAL frame/pin contract), so the wire
+   format cannot drift from either end. See
+   [`linuxcnc-spi-bridge.md`](linuxcnc-spi-bridge.md).
 
 Run it through the Makefile (which sets the default input paths):
 
@@ -119,7 +132,7 @@ python3 scripts/generate_ethercat_config.py \
 ```
 
 It prints a one-line summary, e.g.
-`wrote …/generated.rs (1 slave(s), 55-byte image, 17 pins)`.
+`wrote …/generated.rs (2 slave(s), 110-byte image, 34 pins)`.
 
 ### Assumptions / limitations to know
 
@@ -157,50 +170,58 @@ command).
 
 ---
 
-## 4. The generated table for the v1 drive
+## 4. The generated table for the two drives
 
-`make config` on the committed XML produces this `BUS` (abridged) for the single
-YAKO/Bohign drive — a **55-byte image** (16 output bytes + 39 input bytes), a
-**100 Hz** cycle, **DC SYNC0**, and one SDO init (`0x6060 = 8`, CSP mode):
+`make config` on the committed XML produces this `BUS` (abridged) for the two
+identical YAKO/Bohign drives — a **110-byte image** (`2 × (16 output + 39 input)`
+= 32 output bytes + 78 input bytes), a **100 Hz** cycle, **DC SYNC0**, and one SDO
+init per drive (`0x6060 = 8`, CSP mode):
 
 ```rust
-// src/ethercat/config/generated.rs (excerpt)
+// src/ethercat/config/generated.rs (excerpt; drive0's SM/SDO shown, drive1 identical)
 const S0_SMS: &[SmCfg] = &[
     SmCfg { index: 2, phys_start: 0x1200, control: 0x64, dir: EcDirection::Output, size: 16, pdos: S0_RX_PDOS },
     SmCfg { index: 3, phys_start: 0x1300, control: 0x20, dir: EcDirection::Input,  size: 39, pdos: S0_TX_PDOS },
 ];
+// Layout is ALL outputs first, then ALL inputs, so each slave's input FMMU starts
+// after BOTH drives' output blocks (drive0 out 0..16, drive1 out 16..32).
 const S0_FMMUS: &[FmmuCfg] = &[
     FmmuCfg { logical_start: 0,  size: 16, phys_start: 0x1200, dir: EcDirection::Output },
-    FmmuCfg { logical_start: 16, size: 39, phys_start: 0x1300, dir: EcDirection::Input },
+    FmmuCfg { logical_start: 32, size: 39, phys_start: 0x1300, dir: EcDirection::Input },
+];
+const S1_FMMUS: &[FmmuCfg] = &[
+    FmmuCfg { logical_start: 16, size: 16, phys_start: 0x1200, dir: EcDirection::Output },
+    FmmuCfg { logical_start: 71, size: 39, phys_start: 0x1300, dir: EcDirection::Input },
 ];
 const S0_SDO_INIT: &[SdoInit] = &[
-    SdoInit { index: 0x6060, subindex: 0x00, data: &[0x08] },
+    SdoInit { index: 0x6060, subindex: 0x00, data: &[0x08] },  // CSP mode (also S1_SDO_INIT)
 ];
 
 pub const BUS: BusCfg = BusCfg {
     cycle_ns: 10000000,        // 100 Hz
     ref_clock_slave: 0,
-    slaves: SLAVES,            // one SlaveCfg: vid 0x994, pid 0x1B00, DC 0x0300
-    pins: PINS,                // 17 named pins (see below)
-    image_size: 55,
+    slaves: SLAVES,            // two SlaveCfg (drive0 + drive1), both vid 0x994 / pid 0x1B00, DC 0x0300
+    pins: PINS,                // 34 named pins (17 per drive; see below)
+    image_size: 110,
 };
 ```
 
 ### The process image and pin map
 
-Outputs occupy bytes `0..16`, inputs `16..55`. A few of the 17 generated pins:
+Outputs occupy bytes `0..32` (drive0 `0..16`, drive1 `16..32`); inputs `32..110`
+(drive0 `32..71`, drive1 `71..110`). A few of the 34 generated pins:
 
 | Pin | Dir | Offset | Bits | Type |
 | --- | --- | --- | --- | --- |
 | `drive0-controlword` | OUT | 0 | 16 | U32 |
 | `drive0-target-position` | OUT | 2 | 32 | S32 |
-| `drive0-target-velocity` | OUT | 6 | 32 | S32 |
 | `drive0-digital-outputs` | OUT | 12 | 32 | U32 |
-| `drive0-error-code` | IN | 16 | 16 | U32 |
-| `drive0-statusword` | IN | 18 | 16 | U32 |
-| `drive0-actual-position` | IN | 20 | 32 | S32 |
-| `drive0-actual-velocity` | IN | 28 | 32 | S32 |
-| `drive0-op-mode-display` | IN | 54 | 8 | S32 |
+| `drive1-controlword` | OUT | 16 | 16 | U32 |
+| `drive0-error-code` | IN | 32 | 16 | U32 |
+| `drive0-statusword` | IN | 34 | 16 | U32 |
+| `drive0-actual-position` | IN | 36 | 32 | S32 |
+| `drive0-op-mode-display` | IN | 70 | 8 | S32 |
+| `drive1-statusword` | IN | 73 | 16 | U32 |
 
 (`pdos` over serial prints the full list with offsets at runtime.)
 
@@ -220,7 +241,9 @@ different the new target is:
 4. **Change the cycle rate:** set `master @appTimePeriod` (e.g. `250000` for
    4 kHz). With `sync0Cycle="*1"`, SYNC0 follows automatically.
 5. **Add slaves:** append more `<slave>` blocks; the image grows and the working
-   counter is recomputed. (Multi-slave is built but not yet hardware-verified.)
+   counter is recomputed (`+3` per drive). **Namespace each slave's `halPin` names**
+   (`drive0-*`, `drive1-*`) — a duplicate name is rejected at generate time. (The
+   committed two-drive bus is hardware-verified.)
 
 Then regenerate and rebuild:
 
@@ -232,9 +255,10 @@ make hex                    # rebuild the firmware
 # review `git diff` on generated.rs, then commit it
 ```
 
-After flashing, `rescan` then `start -p<pos>` and confirm `status` shows
-`cyclic OP wkc=…` with the expected working counter (a slave with SM2 + SM3
-contributes `+3`). See [`cli-reference.md`](cli-reference.md) and the
+After flashing, `rescan` then `start` (it brings up the whole bus) and confirm
+`status` shows `cyclic OP <rate>Hz wkc=…` with the expected working counter (a
+slave with SM2 + SM3 contributes `+3`; the two-drive bus → `6/6`). See
+[`cli-reference.md`](cli-reference.md) and the
 [README quick start](../README.md#quick-start--using-it-as-a-driver).
 
 > The historical brief [`pdo-planning-input.md`](pdo-planning-input.md) has a

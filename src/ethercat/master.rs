@@ -12,9 +12,9 @@
 //! `io_sem`/spinlocks -> RTIC tasks + resources.
 
 use crate::ethercat::config::generated::BUS;
-use crate::ethercat::config::model::SlaveCfg;
-use crate::ethercat::cyclic::{Cyclic, CyclicStatus};
+use crate::ethercat::cyclic::{Cyclic, CyclicSlave, CyclicStatus};
 use crate::ethercat::datagram::{self, Command};
+use crate::ethercat::dc::DcRef;
 use crate::ethercat::device::{Device, Pump};
 use crate::ethercat::ecrt::EcError;
 use crate::ethercat::fsm_change::FsmChange;
@@ -47,10 +47,10 @@ pub enum Request {
         data: [u8; 4],
         len: u8,
     },
-    /// Configure a slave to SAFE-OP and start the cyclic process-data engine,
-    /// running at a `cycle_ns` period (drives both the PIT and the jitter
-    /// baseline).
-    StartCyclic { slave: u16, cycle_ns: u64 },
+    /// Configure EVERY desired slave to SAFE-OP and start the cyclic process-
+    /// data engine, running at a `cycle_ns` period (drives both the PIT and the
+    /// jitter baseline). The engine then drives all slaves to OP.
+    StartCyclic { cycle_ns: u64 },
     /// Stop the cyclic engine.
     StopCyclic,
 }
@@ -188,30 +188,31 @@ impl<'a> Master<'a> {
                     },
                 }
             }
-            Request::StartCyclic { slave, cycle_ns } => {
-                let s = self.slave_copy(slave)?;
-                let cfg = slave_cfg(slave).ok_or(EcError::NoSuchSlave)?;
+            Request::StartCyclic { cycle_ns } => {
+                // Bring up EVERY configured slave to SAFE-OP (one per-slave FSM at
+                // a time), then the cyclic engine drives them all to OP. Requires
+                // a prior scan; the LRW spans the whole bus, so a single slave is
+                // just the N == 1 case. The `slave` CLI position is retained for
+                // compatibility but no longer selects a subset.
+                if self.slaves.is_empty() {
+                    return Err(EcError::NoSuchSlave);
+                }
                 Op::StartCyclic {
-                    fsm: FsmSlaveConfig::new(s.station_addr, s.mailbox(), cfg),
-                    station: s.station_addr,
+                    seq: ConfigSeq::new(),
                     cycle_ns,
                 }
             }
             Request::StopCyclic => {
-                // Defense in depth: bring the drive down to PRE-OP before the
-                // cyclic LRW stops, so its SM2 (output) watchdog never times out
+                // Defense in depth: bring EVERY drive down to PRE-OP before the
+                // cyclic LRW stops, so no slave's SM2 (output) watchdog times out
                 // and latches an AL error. The down-transition is best-effort
                 // (see `drive`); if the engine isn't running there's nothing to
                 // bring down. The PIT is already stopped by the `stop` CLI path,
                 // so the device is free for the state-change datagrams here.
-                let (down, station) = match self.cyclic.as_ref() {
-                    Some(c) => (
-                        Some(FsmChange::new(c.station(), al_state::PREOP)),
-                        c.station(),
-                    ),
-                    None => (None, 0),
-                };
-                Op::StopCyclic { down, station }
+                let stations = self.cyclic.as_ref().map(|c| c.stations()).unwrap_or_default();
+                Op::StopCyclic {
+                    down: DownSeq::new(stations),
+                }
             }
         };
         self.op = Some(op);
@@ -289,26 +290,32 @@ impl<'a> Master<'a> {
                     SdoOp::Download { .. } => Ok(Some(Outcome::SdoDownloaded)),
                 }
             }
-            Op::StartCyclic { fsm, station, cycle_ns } => {
-                if fsm.step(&mut self.device, &mut self.index)? {
-                    self.cyclic = Some(Cyclic::new(*station, *cycle_ns));
+            Op::StartCyclic { seq, cycle_ns } => {
+                if seq.step(&mut self.device, &mut self.index, &self.slaves)? {
+                    // Every configured slave is at SAFE-OP now; reflect it in the
+                    // tracked AL state (the cyclic engine drives them to OP next).
+                    for cs in seq.ready.iter() {
+                        self.update_state(cs.station, al_state::SAFEOP);
+                    }
+                    self.cyclic =
+                        Some(Cyclic::new(&seq.ready, BUS.ref_clock_slave, *cycle_ns));
                     Ok(Some(Outcome::CyclicStarted))
                 } else {
                     Ok(None)
                 }
             }
-            Op::StopCyclic { down, station } => {
-                // Step the down-transition to PRE-OP while it is pending. It is
-                // best-effort: any error (link down, slave gone) is ignored so
+            Op::StopCyclic { down } => {
+                // Step the per-slave down-transition to PRE-OP while pending. It
+                // is best-effort: any error (link down, slave gone) is skipped so
                 // `stop` always tears the engine down and the operator regains
                 // control. The error-ack on the next `start` is the backstop if
                 // this doesn't complete.
-                if let Some(fsm) = down.as_mut() {
-                    match fsm.step(&mut self.device, &mut self.index) {
-                        Ok(false) => return Ok(None),
-                        Ok(true) => self.update_state(*station, al_state::PREOP),
-                        Err(_) => {}
-                    }
+                let (done, reached) = down.step(&mut self.device, &mut self.index);
+                if let Some(station) = reached {
+                    self.update_state(station, al_state::PREOP);
+                }
+                if !done {
+                    return Ok(None);
                 }
                 self.cyclic = None;
                 Ok(Some(Outcome::CyclicStopped))
@@ -435,23 +442,133 @@ enum Op {
         request: SdoOp,
     },
     StartCyclic {
-        fsm: FsmSlaveConfig,
-        station: u16,
+        /// Per-slave bring-up sequencer (all configured slaves -> SAFE-OP).
+        seq: ConfigSeq,
         cycle_ns: u64,
     },
     StopCyclic {
-        /// Best-effort down-transition to PRE-OP, stepped before the engine is
-        /// dropped so the drive's SM watchdog never latches an AL error. `None`
-        /// when no engine was running.
-        down: Option<FsmChange>,
-        /// Station of the slave being brought down (to update tracked state).
-        station: u16,
+        /// Best-effort per-slave down-transition to PRE-OP, stepped before the
+        /// engine is dropped so no drive's SM watchdog latches an AL error.
+        down: DownSeq,
     },
 }
 
-/// Find the compile-time desired configuration for a slave ring position.
-fn slave_cfg(pos: u16) -> Option<&'static SlaveCfg> {
-    BUS.slaves.iter().find(|s| s.position == pos)
+/// Brings every configured slave to SAFE-OP in ring order, one slave's
+/// `FsmSlaveConfig` at a time, collecting each slave's (station, ring position)
+/// for the cyclic engine. Mirrors IgH configuring all slaves before the domain
+/// goes operational; here the per-slave FSM is unchanged and simply run N times.
+struct ConfigSeq {
+    /// Index into `BUS.slaves` of the slave currently being configured.
+    idx: usize,
+    /// The active per-slave bring-up FSM (created lazily for `idx`).
+    fsm: Option<FsmSlaveConfig>,
+    /// Slaves collected as each is matched to the scan + configured.
+    ready: Vec<CyclicSlave, EC_MAX_SLAVES>,
+}
+
+impl ConfigSeq {
+    fn new() -> Self {
+        Self {
+            idx: 0,
+            fsm: None,
+            ready: Vec::new(),
+        }
+    }
+
+    /// Advance the bring-up by one datagram. `Ok(true)` once every configured
+    /// slave has reached SAFE-OP. Errors if a configured slave is not present on
+    /// the scanned bus (don't bring up a partial bus that would fail the WKC).
+    fn step(
+        &mut self,
+        dev: &mut Device,
+        index: &mut u8,
+        slaves: &[SlaveInfo],
+    ) -> Result<bool, EcError> {
+        let cfgs = BUS.slaves;
+        if self.idx >= cfgs.len() {
+            return Ok(true);
+        }
+        if self.fsm.is_none() {
+            let cfg = &cfgs[self.idx];
+            // Match the configured slave to a discovered one by ring position.
+            let info = slaves
+                .iter()
+                .find(|s| s.ring_pos == cfg.position)
+                .ok_or(EcError::NoSuchSlave)?;
+            let _ = self.ready.push(CyclicSlave {
+                station: info.station_addr,
+                ring_pos: info.ring_pos,
+            });
+            // DC reference context: a follower (any slave that is not the DC
+            // reference) gets static offset/delay compensation measured against
+            // the reference before SYNC0 activation. The reference clock and a
+            // single-slave bus keep the unchanged per-slave SYNC0 path.
+            let dc_ref = match slaves.iter().find(|s| s.ring_pos == BUS.ref_clock_slave) {
+                Some(r) if r.station_addr != info.station_addr => DcRef {
+                    ref_station: r.station_addr,
+                    compensate: true,
+                },
+                _ => DcRef::reference(),
+            };
+            self.fsm = Some(FsmSlaveConfig::new(
+                info.station_addr,
+                info.mailbox(),
+                cfg,
+                dc_ref,
+            ));
+        }
+        if self.fsm.as_mut().unwrap().step(dev, index)? {
+            self.fsm = None;
+            self.idx += 1;
+        }
+        Ok(self.idx >= cfgs.len())
+    }
+}
+
+/// Walks every cyclic slave down to PRE-OP, one `FsmChange` at a time, before
+/// the engine is dropped. Best-effort: a slave that errors (link down, gone) is
+/// skipped so the sequence always converges and `stop` always completes.
+struct DownSeq {
+    stations: Vec<u16, EC_MAX_SLAVES>,
+    idx: usize,
+    change: Option<FsmChange>,
+}
+
+impl DownSeq {
+    fn new(stations: Vec<u16, EC_MAX_SLAVES>) -> Self {
+        Self {
+            stations,
+            idx: 0,
+            change: None,
+        }
+    }
+
+    /// Advance by one datagram. Returns `(done, reached_preop)` where `done` is
+    /// true once every slave has been driven down (or skipped) and
+    /// `reached_preop` is the station that just reached PRE-OP (to update the
+    /// tracked AL state).
+    fn step(&mut self, dev: &mut Device, index: &mut u8) -> (bool, Option<u16>) {
+        if self.idx >= self.stations.len() {
+            return (true, None);
+        }
+        let station = self.stations[self.idx];
+        if self.change.is_none() {
+            self.change = Some(FsmChange::new(station, al_state::PREOP));
+        }
+        match self.change.as_mut().unwrap().step(dev, index) {
+            Ok(false) => (false, None),
+            Ok(true) => {
+                self.change = None;
+                self.idx += 1;
+                (self.idx >= self.stations.len(), Some(station))
+            }
+            Err(_) => {
+                self.change = None;
+                self.idx += 1;
+                (self.idx >= self.stations.len(), None)
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

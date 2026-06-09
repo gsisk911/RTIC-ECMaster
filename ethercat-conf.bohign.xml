@@ -1,25 +1,35 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-  lcec-style EtherCAT bus configuration: ONE YAKO/Bohign drive.
+  lcec-style EtherCAT bus configuration: TWO identical CL57EC-class drives.
 
-  Source device : Bohign_MS_ECAT_V2.5.xml  ->  "YAKO ESD2505PE"
-                  Vendor  0x00000994 (Shenzhen YAKO)
+  Source device : Bohign_MS_ECAT_V2.5.xml  ->  "YAKO ESD2505PE" family
+                  Vendor  0x00000994
                   Product 0x00001B00
                   Rev     0x00000001
-  Mapping       : stock RxPDO1 (0x1600) + TxPDO1 (0x1A00), verbatim from the ESI.
-                  This mapping is identical across the MS/ESD common-layout family,
-                  so to target another model change only the slave `pid`.
+  Hardware note : both connected drives enumerate as vid 0x00000994 /
+                  pid 0x00001B00 (confirmed by the live bus scan). The user's
+                  "CL57EC" drives use this EtherCAT identity / ESI layout, so
+                  the two slaves below are identical apart from position + the
+                  `driveN-` halPin namespace.
+  Mapping       : stock RxPDO1 (0x1600) + TxPDO1 (0x1A00), verbatim from the ESI,
+                  identical across the MS/ESD/CL57 common-layout family. To
+                  target a different model, change the slave `pid` (and, if its
+                  PDO layout differs, the pdoEntry list).
 
   Consumed at COMPILE TIME by scripts/generate_ethercat_config.py, which emits
   src/ethercat/config/generated.rs. It is NOT parsed on the MCU.
 
   Cycle: appTimePeriod is the master cycle in nanoseconds.
-         10000000 ns = 100 Hz (current bring-up test)
-           250000 ns = 4 kHz  (target; just change appTimePeriod)
+         10000000 ns = 100 Hz (default; the `start -r<hz>` CLI overrides it)
+           250000 ns = 4 kHz  (target; verified wkc 3/3)
          sync0Cycle="*1" = SYNC0 fires once per appTimePeriod.
+         refClockSlaveIdx="0" = slave 0 is the DC reference clock; slave 1
+         disciplines to it (real DC drift is read from 0x092C per non-ref slave).
 -->
 <masters>
   <master idx="0" appTimePeriod="10000000" refClockSyncCycles="1" refClockSlaveIdx="0">
+
+    <!-- ── Slave 0 (station 1) ──────────────────────────────────────────── -->
     <slave idx="0" type="generic" vid="0x00000994" pid="0x00001B00" configPdos="true" name="drive0">
 
       <!-- Distributed Clocks: SYNC0 enabled (DC-Synchron op-mode 0x0300). -->
@@ -60,5 +70,48 @@
       </syncManager>
 
     </slave>
+
+    <!-- ── Slave 1 (station 2) ── identical drive, driveN- pin namespace ──── -->
+    <slave idx="1" type="generic" vid="0x00000994" pid="0x00001B00" configPdos="true" name="drive1">
+
+      <!-- Distributed Clocks: SYNC0 enabled (DC-Synchron op-mode 0x0300). -->
+      <dcConf assignActivate="0x0300" sync0Cycle="*1" sync0Shift="0"/>
+
+      <!-- Init SDO: Modes of Operation = 8 (CSP). Mirrors the ESI PS InitCmd. -->
+      <sdoConfig idx="0x6060" subIdx="0x00">
+        <sdoDataRaw data="08"/>
+      </sdoConfig>
+
+      <!-- SM2 / RxPDO1 0x1600 : outputs (master -> drive), 16 bytes. -->
+      <syncManager idx="2" dir="out">
+        <pdo idx="1600">
+          <pdoEntry idx="6040" subIdx="00" bitLen="16" halType="u32" halPin="drive1-controlword"/>
+          <pdoEntry idx="607a" subIdx="00" bitLen="32" halType="s32" halPin="drive1-target-position"/>
+          <pdoEntry idx="60ff" subIdx="00" bitLen="32" halType="s32" halPin="drive1-target-velocity"/>
+          <pdoEntry idx="60b8" subIdx="00" bitLen="16" halType="u32" halPin="drive1-touch-probe-function"/>
+          <pdoEntry idx="60fe" subIdx="01" bitLen="32" halType="u32" halPin="drive1-digital-outputs"/>
+        </pdo>
+      </syncManager>
+
+      <!-- SM3 / TxPDO1 0x1A00 : inputs (drive -> master), 39 bytes. -->
+      <syncManager idx="3" dir="in">
+        <pdo idx="1a00">
+          <pdoEntry idx="603f" subIdx="00" bitLen="16" halType="u32" halPin="drive1-error-code"/>
+          <pdoEntry idx="6041" subIdx="00" bitLen="16" halType="u32" halPin="drive1-statusword"/>
+          <pdoEntry idx="6064" subIdx="00" bitLen="32" halType="s32" halPin="drive1-actual-position"/>
+          <pdoEntry idx="60fd" subIdx="00" bitLen="32" halType="u32" halPin="drive1-digital-inputs"/>
+          <pdoEntry idx="606c" subIdx="00" bitLen="32" halType="s32" halPin="drive1-actual-velocity"/>
+          <pdoEntry idx="60f4" subIdx="00" bitLen="32" halType="s32" halPin="drive1-follow-error"/>
+          <pdoEntry idx="60b9" subIdx="00" bitLen="16" halType="u32" halPin="drive1-touch-probe-status"/>
+          <pdoEntry idx="60ba" subIdx="00" bitLen="32" halType="s32" halPin="drive1-touch-probe-pos1-positive"/>
+          <pdoEntry idx="60bb" subIdx="00" bitLen="32" halType="s32" halPin="drive1-touch-probe-pos1-negative"/>
+          <pdoEntry idx="60bc" subIdx="00" bitLen="32" halType="s32" halPin="drive1-touch-probe-pos2-positive"/>
+          <pdoEntry idx="60bd" subIdx="00" bitLen="32" halType="s32" halPin="drive1-touch-probe-pos2-negative"/>
+          <pdoEntry idx="6061" subIdx="00" bitLen="8" halType="s32" halPin="drive1-op-mode-display"/>
+        </pdo>
+      </syncManager>
+
+    </slave>
+
   </master>
 </masters>

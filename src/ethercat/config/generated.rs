@@ -55,15 +55,63 @@ const S0_SMS: &[SmCfg] = &[
 
 const S0_FMMUS: &[FmmuCfg] = &[
     FmmuCfg { logical_start: 0, size: 16, phys_start: 0x1200, dir: EcDirection::Output },
-    FmmuCfg { logical_start: 16, size: 39, phys_start: 0x1300, dir: EcDirection::Input },
+    FmmuCfg { logical_start: 32, size: 39, phys_start: 0x1300, dir: EcDirection::Input },
 ];
 
 const S0_SDO_INIT: &[SdoInit] = &[
     SdoInit { index: 0x6060, subindex: 0x00, data: &[0x08] },
 ];
 
+// --- Slave 1: product 0x00001B00 ---
+
+const S1_RX_P0_ENTRIES: &[EcPdoEntryInfo] = &[
+    e(0x6040, 0x00, 16),
+    e(0x607A, 0x00, 32),
+    e(0x60FF, 0x00, 32),
+    e(0x60B8, 0x00, 16),
+    e(0x60FE, 0x01, 32),
+];
+
+const S1_RX_PDOS: &[PdoCfg] = &[
+    PdoCfg { index: 0x1600, entries: S1_RX_P0_ENTRIES },
+];
+
+const S1_TX_P0_ENTRIES: &[EcPdoEntryInfo] = &[
+    e(0x603F, 0x00, 16),
+    e(0x6041, 0x00, 16),
+    e(0x6064, 0x00, 32),
+    e(0x60FD, 0x00, 32),
+    e(0x606C, 0x00, 32),
+    e(0x60F4, 0x00, 32),
+    e(0x60B9, 0x00, 16),
+    e(0x60BA, 0x00, 32),
+    e(0x60BB, 0x00, 32),
+    e(0x60BC, 0x00, 32),
+    e(0x60BD, 0x00, 32),
+    e(0x6061, 0x00, 8),
+];
+
+const S1_TX_PDOS: &[PdoCfg] = &[
+    PdoCfg { index: 0x1A00, entries: S1_TX_P0_ENTRIES },
+];
+
+const S1_SMS: &[SmCfg] = &[
+    SmCfg { index: 2, phys_start: 0x1200, control: 0x64, dir: EcDirection::Output, size: 16, pdos: S1_RX_PDOS },
+    SmCfg { index: 3, phys_start: 0x1300, control: 0x20, dir: EcDirection::Input, size: 39, pdos: S1_TX_PDOS },
+];
+
+const S1_FMMUS: &[FmmuCfg] = &[
+    FmmuCfg { logical_start: 16, size: 16, phys_start: 0x1200, dir: EcDirection::Output },
+    FmmuCfg { logical_start: 71, size: 39, phys_start: 0x1300, dir: EcDirection::Input },
+];
+
+const S1_SDO_INIT: &[SdoInit] = &[
+    SdoInit { index: 0x6060, subindex: 0x00, data: &[0x08] },
+];
+
 const SLAVES: &[SlaveCfg] = &[
     SlaveCfg { position: 0, vendor_id: 0x00000994, product_code: 0x00001B00, sms: S0_SMS, fmmus: S0_FMMUS, dc: Some(DcCfg { assign_activate: 0x0300, sync0_cycle_ns: 10000000, sync0_shift_ns: 0, sync1_cycle_ns: 0 }), sdo_init: S0_SDO_INIT, out_size: 16, in_size: 39 },
+    SlaveCfg { position: 1, vendor_id: 0x00000994, product_code: 0x00001B00, sms: S1_SMS, fmmus: S1_FMMUS, dc: Some(DcCfg { assign_activate: 0x0300, sync0_cycle_ns: 10000000, sync0_shift_ns: 0, sync1_cycle_ns: 0 }), sdo_init: S1_SDO_INIT, out_size: 16, in_size: 39 },
 ];
 
 const PINS: &[PinCfg] = &[
@@ -72,18 +120,35 @@ const PINS: &[PinCfg] = &[
     PinCfg { name: "drive0-target-velocity", byte_offset: 6, bit_pos: 0, bit_len: 32, hal_type: HalType::S32, dir: EcDirection::Output },
     PinCfg { name: "drive0-touch-probe-function", byte_offset: 10, bit_pos: 0, bit_len: 16, hal_type: HalType::U32, dir: EcDirection::Output },
     PinCfg { name: "drive0-digital-outputs", byte_offset: 12, bit_pos: 0, bit_len: 32, hal_type: HalType::U32, dir: EcDirection::Output },
-    PinCfg { name: "drive0-error-code", byte_offset: 16, bit_pos: 0, bit_len: 16, hal_type: HalType::U32, dir: EcDirection::Input },
-    PinCfg { name: "drive0-statusword", byte_offset: 18, bit_pos: 0, bit_len: 16, hal_type: HalType::U32, dir: EcDirection::Input },
-    PinCfg { name: "drive0-actual-position", byte_offset: 20, bit_pos: 0, bit_len: 32, hal_type: HalType::S32, dir: EcDirection::Input },
-    PinCfg { name: "drive0-digital-inputs", byte_offset: 24, bit_pos: 0, bit_len: 32, hal_type: HalType::U32, dir: EcDirection::Input },
-    PinCfg { name: "drive0-actual-velocity", byte_offset: 28, bit_pos: 0, bit_len: 32, hal_type: HalType::S32, dir: EcDirection::Input },
-    PinCfg { name: "drive0-follow-error", byte_offset: 32, bit_pos: 0, bit_len: 32, hal_type: HalType::S32, dir: EcDirection::Input },
-    PinCfg { name: "drive0-touch-probe-status", byte_offset: 36, bit_pos: 0, bit_len: 16, hal_type: HalType::U32, dir: EcDirection::Input },
-    PinCfg { name: "drive0-touch-probe-pos1-positive", byte_offset: 38, bit_pos: 0, bit_len: 32, hal_type: HalType::S32, dir: EcDirection::Input },
-    PinCfg { name: "drive0-touch-probe-pos1-negative", byte_offset: 42, bit_pos: 0, bit_len: 32, hal_type: HalType::S32, dir: EcDirection::Input },
-    PinCfg { name: "drive0-touch-probe-pos2-positive", byte_offset: 46, bit_pos: 0, bit_len: 32, hal_type: HalType::S32, dir: EcDirection::Input },
-    PinCfg { name: "drive0-touch-probe-pos2-negative", byte_offset: 50, bit_pos: 0, bit_len: 32, hal_type: HalType::S32, dir: EcDirection::Input },
-    PinCfg { name: "drive0-op-mode-display", byte_offset: 54, bit_pos: 0, bit_len: 8, hal_type: HalType::S32, dir: EcDirection::Input },
+    PinCfg { name: "drive0-error-code", byte_offset: 32, bit_pos: 0, bit_len: 16, hal_type: HalType::U32, dir: EcDirection::Input },
+    PinCfg { name: "drive0-statusword", byte_offset: 34, bit_pos: 0, bit_len: 16, hal_type: HalType::U32, dir: EcDirection::Input },
+    PinCfg { name: "drive0-actual-position", byte_offset: 36, bit_pos: 0, bit_len: 32, hal_type: HalType::S32, dir: EcDirection::Input },
+    PinCfg { name: "drive0-digital-inputs", byte_offset: 40, bit_pos: 0, bit_len: 32, hal_type: HalType::U32, dir: EcDirection::Input },
+    PinCfg { name: "drive0-actual-velocity", byte_offset: 44, bit_pos: 0, bit_len: 32, hal_type: HalType::S32, dir: EcDirection::Input },
+    PinCfg { name: "drive0-follow-error", byte_offset: 48, bit_pos: 0, bit_len: 32, hal_type: HalType::S32, dir: EcDirection::Input },
+    PinCfg { name: "drive0-touch-probe-status", byte_offset: 52, bit_pos: 0, bit_len: 16, hal_type: HalType::U32, dir: EcDirection::Input },
+    PinCfg { name: "drive0-touch-probe-pos1-positive", byte_offset: 54, bit_pos: 0, bit_len: 32, hal_type: HalType::S32, dir: EcDirection::Input },
+    PinCfg { name: "drive0-touch-probe-pos1-negative", byte_offset: 58, bit_pos: 0, bit_len: 32, hal_type: HalType::S32, dir: EcDirection::Input },
+    PinCfg { name: "drive0-touch-probe-pos2-positive", byte_offset: 62, bit_pos: 0, bit_len: 32, hal_type: HalType::S32, dir: EcDirection::Input },
+    PinCfg { name: "drive0-touch-probe-pos2-negative", byte_offset: 66, bit_pos: 0, bit_len: 32, hal_type: HalType::S32, dir: EcDirection::Input },
+    PinCfg { name: "drive0-op-mode-display", byte_offset: 70, bit_pos: 0, bit_len: 8, hal_type: HalType::S32, dir: EcDirection::Input },
+    PinCfg { name: "drive1-controlword", byte_offset: 16, bit_pos: 0, bit_len: 16, hal_type: HalType::U32, dir: EcDirection::Output },
+    PinCfg { name: "drive1-target-position", byte_offset: 18, bit_pos: 0, bit_len: 32, hal_type: HalType::S32, dir: EcDirection::Output },
+    PinCfg { name: "drive1-target-velocity", byte_offset: 22, bit_pos: 0, bit_len: 32, hal_type: HalType::S32, dir: EcDirection::Output },
+    PinCfg { name: "drive1-touch-probe-function", byte_offset: 26, bit_pos: 0, bit_len: 16, hal_type: HalType::U32, dir: EcDirection::Output },
+    PinCfg { name: "drive1-digital-outputs", byte_offset: 28, bit_pos: 0, bit_len: 32, hal_type: HalType::U32, dir: EcDirection::Output },
+    PinCfg { name: "drive1-error-code", byte_offset: 71, bit_pos: 0, bit_len: 16, hal_type: HalType::U32, dir: EcDirection::Input },
+    PinCfg { name: "drive1-statusword", byte_offset: 73, bit_pos: 0, bit_len: 16, hal_type: HalType::U32, dir: EcDirection::Input },
+    PinCfg { name: "drive1-actual-position", byte_offset: 75, bit_pos: 0, bit_len: 32, hal_type: HalType::S32, dir: EcDirection::Input },
+    PinCfg { name: "drive1-digital-inputs", byte_offset: 79, bit_pos: 0, bit_len: 32, hal_type: HalType::U32, dir: EcDirection::Input },
+    PinCfg { name: "drive1-actual-velocity", byte_offset: 83, bit_pos: 0, bit_len: 32, hal_type: HalType::S32, dir: EcDirection::Input },
+    PinCfg { name: "drive1-follow-error", byte_offset: 87, bit_pos: 0, bit_len: 32, hal_type: HalType::S32, dir: EcDirection::Input },
+    PinCfg { name: "drive1-touch-probe-status", byte_offset: 91, bit_pos: 0, bit_len: 16, hal_type: HalType::U32, dir: EcDirection::Input },
+    PinCfg { name: "drive1-touch-probe-pos1-positive", byte_offset: 93, bit_pos: 0, bit_len: 32, hal_type: HalType::S32, dir: EcDirection::Input },
+    PinCfg { name: "drive1-touch-probe-pos1-negative", byte_offset: 97, bit_pos: 0, bit_len: 32, hal_type: HalType::S32, dir: EcDirection::Input },
+    PinCfg { name: "drive1-touch-probe-pos2-positive", byte_offset: 101, bit_pos: 0, bit_len: 32, hal_type: HalType::S32, dir: EcDirection::Input },
+    PinCfg { name: "drive1-touch-probe-pos2-negative", byte_offset: 105, bit_pos: 0, bit_len: 32, hal_type: HalType::S32, dir: EcDirection::Input },
+    PinCfg { name: "drive1-op-mode-display", byte_offset: 109, bit_pos: 0, bit_len: 8, hal_type: HalType::S32, dir: EcDirection::Input },
 ];
 
 pub const BUS: BusCfg = BusCfg {
@@ -91,6 +156,6 @@ pub const BUS: BusCfg = BusCfg {
     ref_clock_slave: 0,
     slaves: SLAVES,
     pins: PINS,
-    image_size: 55,
+    image_size: 110,
 };
 

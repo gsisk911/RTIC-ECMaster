@@ -13,7 +13,7 @@ See the design + firmware side in [`../docs/linuxcnc-spi-bridge.md`](../docs/lin
 | --- | --- |
 | `teensy_bridge_layout.h` | **Generated** frame + pin contract (`make config`). Single source of truth shared with the firmware — never hand-edit. |
 | `teensy_ecat_bridge.c` | The realtime HAL component (spidev transport, dynamic pins from the header, motion stream + flow control). |
-| `teensy_ecat_bridge.hal` | Example HAL wiring (single drive). |
+| `teensy_ecat_bridge.hal` | Example HAL wiring (wires `drive0` only; the committed firmware bus is two drives, `drive0` / `drive1`). |
 
 ## Wiring (hardware)
 
@@ -66,10 +66,14 @@ worst-case servo-thread latency spike in cycles. Start at 10 and tune against
 
 ## HAL pins
 
-- Process data: one pin per `halPin` name, e.g. `teensy-ecat.drive0-target-position`
-  (HAL_IN, host→drive) and `teensy-ecat.drive0-actual-position` (HAL_OUT,
-  drive→host). Types: bit/u32/s32 per the XML `halType`.
-- Intent (HAL_IN): `enable`, `fault-reset`, `quick-stop`.
+- Process data: one pin per `halPin` name, across **all** drives (`drive0-*`,
+  `drive1-*` for the committed two-drive bus), e.g.
+  `teensy-ecat.drive0-target-position` (HAL_IN, host→drive) and
+  `teensy-ecat.drive0-actual-position` (HAL_OUT, drive→host). Types: bit/u32/s32 per
+  the XML `halType`.
+- Intent (HAL_IN): `enable`, `fault-reset`, `quick-stop`. These are applied
+  **bus-wide** — every drive shares one intent (a per-drive host enable is a
+  deferred follow-up).
 - Status (HAL_OUT): `online`, `link`, `operational`, `fault`, `host-timeout`,
   `wkc`, `expected-wkc`, `phase`, `cycle-index`, `buffer-depth`, `crc-errors`.
 
@@ -84,8 +88,9 @@ command (link, watchdog, CRC/seq errors, buffer depth) and `stats`/`status`.
 2. **Feedback.** With the drive powered (not enabled), jog nothing; confirm
    `teensy-ecat.drive0-actual-position` tracks the drive and `wkc == expected-wkc`.
 3. **Enable / fault-reset.** Pulse `fault-reset`, then set `enable`; confirm
-   `operational` goes true and the drive reaches Operation-Enabled (statusword).
-   The Teensy owns the controlword — you only assert intent.
+   `operational` goes true and the drive(s) reach Operation-Enabled (statusword).
+   The Teensy owns the controlword — you only assert intent, and it currently
+   applies **bus-wide** to every drive.
 4. **Position follow.** Wire `motor-pos-cmd`→target and command a slow move;
    confirm `actual-position` follows with acceptable following error.
 5. **Host-watchdog trip.** Stop the component (`halcmd stop` / unload). The host

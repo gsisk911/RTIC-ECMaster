@@ -34,9 +34,7 @@ use ethercat::cli;
 use ethercat::cyclic::{CyclicStatus, Phase as CyclicPhase};
 use ethercat::device::{Device, ECAT_MTU, ECAT_RX_LEN, ECAT_TX_LEN};
 use ethercat::ecrt::EcError;
-use ethercat::globals::EC_MAX_SLAVES;
 use ethercat::master::{Master, Outcome, Request};
-use ethercat::slave::SlaveInfo;
 use hal::process_data as pdi;
 use board::host_spi::{self, HostSpi, ServiceEvent};
 use hal::host_bridge::{HostBridge, FRAME_LEN};
@@ -104,23 +102,6 @@ unsafe impl Send for HostSpiCell {}
 const ECAT_RESP_LINES: usize = 40;
 /// A multi-line command response produced by the worker.
 type RespLines = heapless::Vec<heapless::String<96>, ECAT_RESP_LINES>;
-
-/// Bus-scan result shared from the worker to the USB reporter (boot report).
-pub struct EcatScan {
-    slaves: heapless::Vec<SlaveInfo, EC_MAX_SLAVES>,
-    done: bool,
-    failed: bool,
-}
-
-impl EcatScan {
-    const fn new() -> Self {
-        Self {
-            slaves: heapless::Vec::new(),
-            done: false,
-            failed: false,
-        }
-    }
-}
 
 /// Byte capacity of one command's full (multi-line) response.
 const ECAT_OUT_CAP: usize = ECAT_RESP_LINES * 98;
@@ -617,11 +598,13 @@ fn ecat_pd<M: Mutex<T = EcatMasterCell>>(
 ) {
     match pin {
         None => {
-            let mut img = [0u8; 64];
+            // Sized to dump a multi-slave process image (the planned bus is
+            // ~306 B); `pd <pin>` reads any single pin regardless of this cap.
+            let mut img = [0u8; 320];
             let info = master.lock(|m| {
                 let st = m.0.cyclic_status();
                 let n = m.0.cyclic_image().map(|im| {
-                    let n = im.len().min(64);
+                    let n = im.len().min(img.len());
                     img[..n].copy_from_slice(&im[..n]);
                     n
                 });
@@ -694,8 +677,8 @@ fn ecat_stats<M: Mutex<T = EcatMasterCell>>(master: &mut M, out: &mut RespLines)
             resp_push(
                 out,
                 format_args!(
-                    "[ecat] jitter min={}us max={}us worst={}us ({} cyc)",
-                    st.jitter_min_us, st.jitter_max_us, st.jitter_worst_us, st.jitter_worst_cyc
+                    "[ecat] latency min={}ns max={}ns jitter={}ns (worst {} cyc)",
+                    st.latency_min_ns, st.latency_max_ns, st.jitter_ns, st.latency_max_cyc
                 ),
             );
             if st.dc_valid {
@@ -721,8 +704,8 @@ fn mon_line(st: &CyclicStatus) -> heapless::String<96> {
     let mut s: heapless::String<96> = heapless::String::new();
     let _ = write!(
         s,
-        "[mon] {}Hz cyc={} wkc={}/{} jit={}us dc={}ns",
-        st.rate_hz, st.cycles, st.wkc, st.expected_wkc, st.jitter_worst_us, st.dc_diff_ns
+        "[mon] {}Hz cyc={} wkc={}/{} jit={}ns dc={}ns",
+        st.rate_hz, st.cycles, st.wkc, st.expected_wkc, st.jitter_ns, st.dc_diff_ns
     );
     s
 }
@@ -917,23 +900,26 @@ async fn ecat_run_command<M: Mutex<T = EcatMasterCell>>(
         cli::Command::Start { .. } if busy => {
             resp_push(&mut out, format_args!("[ecat] cyclic already running; 'stop' first"))
         }
-        cli::Command::Start { slave, rate_hz } => {
+        cli::Command::Start { slave: _, rate_hz } => {
             // Resolve the requested rate to a cyclic period: an explicit `-r<hz>`
-            // overrides the compile-time configured period.
+            // overrides the compile-time configured period. `start` brings up the
+            // WHOLE configured bus (the `-p` position is ignored now that one LRW
+            // spans all slaves).
             let cycle_ns = match rate_hz {
                 Some(hz) => 1_000_000_000u64 / hz as u64,
                 None => ethercat::config::generated::BUS.cycle_ns,
             };
-            match ecat_drive(master, Request::StartCyclic { slave, cycle_ns }).await {
+            match ecat_drive(master, Request::StartCyclic { cycle_ns }).await {
                 Ok(Outcome::CyclicStarted) => {
                     // Configure + start the PIT only now (deliberate action), not at boot.
                     let load = board::cycle_timer::configure(cycle_ns);
                     board::cycle_timer::start();
+                    let n = ethercat::config::generated::BUS.slaves.len();
                     resp_push(
                         &mut out,
                         format_args!(
-                            "[ecat] slave {} configured; cyclic PDO started at {} Hz",
-                            slave,
+                            "[ecat] {} slave(s) configured; cyclic PDO started at {} Hz",
+                            n,
                             board::cycle_timer::actual_hz(load)
                         ),
                     );
@@ -1074,10 +1060,11 @@ fn blink_diag(class: u8, count: u8) -> ! {
     }
 }
 
-/// DTCM addresses below this mark the main stack as nearly exhausted: it grows
-/// down from `_stack_start` = 0x2000_4000 toward the bottom of DTCM at
-/// 0x2000_0000. A faulting SP, exception-frame pointer, or BFAR under the guard
-/// is the signature of a stack overflow.
+/// DTCM addresses below this mark the main stack as nearly exhausted: with the
+/// 64 KiB stack (TEENSY4_STACK_SIZE) the initial SP `_stack_start` is ~0x2001_0000,
+/// and the stack grows down toward the bottom of DTCM at 0x2000_0000. A faulting
+/// SP, exception-frame pointer, or BFAR under the guard (1 KiB above the DTCM
+/// floor) is the signature of a stack overflow.
 const FAULT_STACK_GUARD: u32 = 0x2000_0400;
 /// Marks a valid `CrashLog` left in non-zeroed RAM by a fault/panic handler.
 const CRASHLOG_MAGIC: u32 = 0xC0FF_EE00;
@@ -1277,7 +1264,6 @@ mod app {
 
     #[shared]
     struct Shared {
-        ecat_scan: EcatScan,
         ecat_cmd: Option<cli::Command>,
         ecat_out: EcatOut,
         // Owned by the worker (prio 1) and the cyclic PIT task (prio 3); the
@@ -1294,7 +1280,6 @@ mod app {
         usb_configured: bool,
         banner_done: bool,
         banner_line: u8,
-        scan_announced: bool,
         led_a: FastGpioOutput,
         led_b: FastGpioOutput,
         ecat_line: heapless::String<128>,
@@ -1399,7 +1384,6 @@ mod app {
 
         (
             Shared {
-                ecat_scan: EcatScan::new(),
                 ecat_cmd: None,
                 ecat_out: EcatOut::new(),
                 ecat_master: EcatMasterCell(ecat_master),
@@ -1409,7 +1393,6 @@ mod app {
                 usb_configured: false,
                 banner_done: false,
                 banner_line: 0,
-                scan_announced: false,
                 led_a,
                 led_b,
                 ecat_line: heapless::String::new(),
@@ -1434,12 +1417,11 @@ mod app {
 
     #[task(
         binds = USB_OTG1,
-        shared = [ecat_scan, ecat_cmd, ecat_out],
+        shared = [ecat_cmd, ecat_out],
         local = [
             usb_configured,
             banner_done,
             banner_line,
-            scan_announced,
             ecat_line
         ],
         priority = 2
@@ -1505,33 +1487,13 @@ mod app {
                     Err(_) => cx.shared.ecat_out.lock(|o| o.advance(take)),
                 }
             } else if !*cx.local.banner_done {
-                // 3a) One-time boot banner, emitted once per USB attach.
+                // 3a) One-time boot banner, emitted once per USB attach. Scan
+                // results are streamed by the worker on demand (`rescan`/`start`),
+                // so there is no separate boot-scan summary to announce here.
                 if serial_try_banner_line(serial, *cx.local.banner_line) {
                     *cx.local.banner_line += 1;
                     if *cx.local.banner_line >= BOOT_BANNER_LINES {
                         *cx.local.banner_done = true;
-                    }
-                }
-            } else if !*cx.local.scan_announced {
-                // 3b) One-time scan summary, once the worker finishes the scan.
-                let summary = cx.shared.ecat_scan.lock(|s| {
-                    if !s.done {
-                        None
-                    } else {
-                        Some((s.failed, s.slaves.len()))
-                    }
-                });
-                if let Some((failed, count)) = summary {
-                    let ok = if failed {
-                        serial_try_write_line(serial, format_args!("[ecat] bus scan failed"))
-                    } else {
-                        serial_try_write_line(
-                            serial,
-                            format_args!("[ecat] scan complete: {} slave(s); type 'slaves'", count),
-                        )
-                    };
-                    if ok {
-                        *cx.local.scan_announced = true;
                     }
                 }
             }
@@ -1544,10 +1506,9 @@ mod app {
                 cortex_m::peripheral::NVIC::pend(teensy4_bsp::Interrupt::USB_OTG1);
             }
         } else {
-            // Host detached: re-arm the one-time banner/summary for next attach.
+            // Host detached: re-arm the one-time banner for the next attach.
             *cx.local.banner_done = false;
             *cx.local.banner_line = 0;
-            *cx.local.scan_announced = false;
             cx.local.ecat_line.clear();
         }
 
@@ -1559,7 +1520,7 @@ mod app {
         }
     }
 
-    #[task(shared = [ecat_scan, ecat_cmd, ecat_out, ecat_master, host_bridge], priority = 1)]
+    #[task(shared = [ecat_cmd, ecat_out, ecat_master, host_bridge], priority = 1)]
     async fn ethercat_worker(mut cx: ethercat_worker::Context) {
         // Let USB enumerate before touching the (shared) master. The master
         // lock's ceiling is raised to the cyclic PIT task's priority (3), which

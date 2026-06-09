@@ -11,7 +11,9 @@ read/write, walks the EtherCAT state machine (INIT → PRE-OP → SAFE-OP → OP
 performs full slave configuration (sync managers, FMMUs, PDO assignment/mapping
 over CoE, Distributed Clocks SYNC0), and runs a PIT-timer-driven cyclic
 process-data engine with named, typed read/write of the process image over a
-serial command line.
+serial command line. An optional Raspberry Pi / LinuxCNC SPI host bridge exchanges
+that same process image once per servo cycle (see
+[`docs/linuxcnc-spi-bridge.md`](docs/linuxcnc-spi-bridge.md)).
 
 > **A note on the crate name.** The project began as a generic Teensy Modbus
 > base, so the crate is still literally named `teensy-rust-modbus-base` in
@@ -24,9 +26,9 @@ serial command line.
 
 ## Status
 
-**Verified on hardware** against a single **YAKO ESD2505PE** servo drive (also
-sold under the Bohign label; vendor `0x00000994`, product `0x00001B00`,
-revision `0x00000001`):
+**Verified on hardware** against **two YAKO ESD2505PE** servo drives (also sold
+under the Bohign label; both enumerate as vendor `0x00000994`, product
+`0x00001B00`, revision `0x00000001`):
 
 - **Bus scan** — broadcast slave count, station-address assignment, AL status,
   DL/base info, and SII identity (vendor / product / revision / mailbox config).
@@ -40,27 +42,50 @@ revision `0x00000001`):
   data sync managers (SM2/SM3), applies SDO init values, writes PDO assignment
   (`0x1C12`/`0x1C13`) and mapping (`0x1600`/`0x1A00`) over CoE, sets the
   watchdog, programs the FMMUs, and brings up **Distributed Clocks SYNC0**.
-- **Cyclic process data** — a **PIT-timer-driven** engine exchanges the process
-  image with one LRW per cycle, gates SAFE-OP → OP on a healthy working counter,
-  and exposes the image as named, typed pins. **Verified at ~100 Hz with
-  `wkc = 3/3`.** The engine is architected for much higher rates (the cycle is
-  set in the bus XML; the hardware timer is sized for up to ~4 kHz / 250 µs).
+- **Cyclic process data** — a **PIT-timer-driven** engine exchanges the whole-bus
+  process image with one LRW per cycle, drives **every** slave SAFE-OP → OP on a
+  healthy working counter, and exposes the image as named, typed pins. **Verified
+  on hardware with two drives reaching OP at `wkc = 6/6`, at both 100 Hz and
+  4 kHz** (an earlier single-drive run soaked 216 k cycles at 4 kHz, `wkc = 3/3`,
+  zero faults). The cyclic rate is selectable at runtime (`start -r<hz>`,
+  50–8000 Hz), and the engine reports interrupt latency / jitter and DC sync error
+  (`stats` / `monitor`).
+- **LinuxCNC / Raspberry Pi host bridge** *(newer, less hardware-tested than the
+  EtherCAT core)* — an LPSPI3 SPI-slave link lets a Pi running LinuxCNC swap the
+  process image once per servo cycle, with a Teensy-owned **CiA-402** drive
+  sequencer, a host watchdog, and a unified safe-state (host-timeout /
+  motion-buffer underrun / EtherCAT fault → drive quick-stop). See
+  [`docs/linuxcnc-spi-bridge.md`](docs/linuxcnc-spi-bridge.md) and
+  [`linuxcnc/`](linuxcnc/).
 
 ### Scope and limitations (v1)
 
-- **Tested topology is a single drive.** The compile-time configuration targets
-  one YAKO/Bohign drive. The architecture (process-image domain, per-slave
-  config FSM, working-counter math) is built for multiple slaves, but multi-slave
-  operation is not yet hardware-verified, and cross-slave DC drift compensation
-  (ARMW/FRMW) is deferred.
-- **Cycle rate.** Verified at 100 Hz. The design target is up to ~4 kHz; higher
-  rates are a change of the configured cycle plus on-hardware validation.
-- **CiA-402 motion control is deferred.** The firmware exchanges process data and
-  exposes the CiA-402 objects as pins (controlword, statusword, target/actual
-  position, etc.), but the controlword/statusword *drive state machine*
-  (`src/ethercat/cia402.rs`) is scaffolding, not an active control loop. You
-  enable the drive by writing the controlword by hand (see the
-  [Quick start](#quick-start--using-it-as-a-driver)).
+- **Tested topology is two drives.** The compile-time configuration targets two
+  identical YAKO/Bohign drives (`drive0` / `drive1`), and both are hardware-verified
+  to OP at `wkc = 6/6`. One LRW spans the whole bus; `start` brings up every
+  configured slave and the working counter scales (`+3` per drive). The
+  process-image domain, per-slave config FSM, and working-counter math are built for
+  up to `EC_MAX_SLAVES` (32) slaves.
+- **Distributed-clocks drift compensation is partial.** In OP with two or more
+  slaves the master **continuously distributes the reference DC time** (an ARMW of
+  register `0x0910` each cycle, auto-increment-addressed at the reference slave) to
+  discipline the followers, and reads real drift from a follower's `0x092C`. The
+  **static** delay/offset compensation (measuring per-port receive times `0x0900`
+  and writing per-slave offsets `0x0920`) is **deferred**, so low-rate residual
+  drift is larger: ≈0.9 ms at 100 Hz, tightening to ±~140 ns at 4 kHz (faster
+  correction = tighter sync). Jitter under sustained load is not yet characterized
+  on hardware.
+- **Cycle rate.** Verified on hardware from 100 Hz to 4 kHz, selectable at runtime
+  with `start -r<hz>`.
+- **CiA-402 sequencing is active only on the LinuxCNC/Pi host-bridge path.** When a
+  Pi host is attached over SPI, the Teensy owns the controlword: `cia402.rs` walks
+  each drive Switch-On-Disabled → Operation-Enabled from the host's *intent*
+  (enable / fault-reset / quick-stop). That intent is currently applied **bus-wide**
+  — every discovered drive shares one enable / fault-reset / quick-stop command; a
+  per-drive host enable is a deferred follow-up. This path is newer and less
+  hardware-tested than the EtherCAT core. On the **serial** path (no host) the
+  sequencer stays inert and you enable a drive by writing the controlword by hand
+  (see the [Quick start](#quick-start--using-it-as-a-driver)).
 - **SDO transfers are expedited only** (≤ 4 bytes). Segmented / complete-access
   transfers are deferred.
 
@@ -112,7 +137,7 @@ This walks from a flashed board to reading and writing live process data.
    [boot] EtherCAT master over RMII ENET; type 'help' for commands
    ```
 
-3. **Scan the bus** to discover the drive:
+3. **Scan the bus** to discover the drives:
 
    ```text
    rescan
@@ -120,29 +145,34 @@ This walks from a flashed board to reading and writing live process data.
 
    ```text
    [scan] counting slaves
-   [scan] count=1
+   [scan] count=2
    [scan] addresses cleared
    [scan] s1: addr set
-   [scan] s1: al=0x01
    [scan] s1: vendor=0x00000994
    [scan] s1: product=0x00001B00
    [scan] s1: proto=0x0004 coe=1
-   [ecat] rescan complete: 1 slave(s); type 'slaves'
+   [scan] s2: addr set
+   [scan] s2: vendor=0x00000994
+   [scan] s2: product=0x00001B00
+   [scan] s2: proto=0x0004 coe=1
+   [ecat] rescan complete: 2 slave(s); type 'slaves'
    ```
 
-4. **Configure + start cyclic process data** on slave 0 (this runs the full
-   INIT → SAFE-OP bring-up and starts the PIT cyclic engine, which then drives
-   the drive to OP):
+4. **Configure + start cyclic process data** for the whole bus (this runs the full
+   INIT → SAFE-OP bring-up on **every** configured slave and starts the PIT cyclic
+   engine, which then drives them all to OP). `start` brings up the entire
+   configured bus — one LRW spans all slaves, so a `-p` position is accepted but no
+   longer selects a subset:
 
    ```text
-   start -p0
+   start
    ```
 
    ```text
-   [ecat] slave 0 configured; cyclic PDO started
+   [ecat] 2 slave(s) configured; cyclic PDO started at 100 Hz
    ```
 
-   Confirm it reached OP with a full working counter:
+   Confirm both reached OP with a full working counter (`+3` per drive → `6/6`):
 
    ```text
    status
@@ -150,19 +180,20 @@ This walks from a flashed board to reading and writing live process data.
 
    ```text
    [ecat] fw 0.1.0 (v0.1.0-g1a2b3c4)
-   [ecat] link=up slaves=1
-   [ecat] cyclic OP wkc=3/3 cycles=12840
+   [ecat] link=up slaves=2
+   [ecat] cyclic OP 100Hz wkc=6/6 cycles=12840 ('stats' for detail)
    ```
 
 5. **Read and write the process image by pin name.** List the pins with `pdos`;
-   read an input; write an output:
+   read an input; write an output. Each drive's pins are namespaced by slave
+   (`drive0-*`, `drive1-*`):
 
    ```text
    pd drive0-statusword
    [ecat] drive0-statusword = 569 (0x239)
 
-   pd drive0-controlword 15
-   [ecat] drive0-controlword <= 15
+   pd drive1-controlword 15
+   [ecat] drive1-controlword <= 15
    ```
 
    `pd` with no arguments dumps the whole process image plus cyclic status. To
@@ -225,10 +256,13 @@ else decimal). The console is request/response and does not echo.
 | `states -p<pos> <INIT\|PREOP\|SAFEOP\|OP>` | Request an AL state on a slave. |
 | `upload -p<pos> [-t<type>] <idx> <sub>` | SDO read (typed value, or raw hex). |
 | `download -p<pos> -t<type> <idx> <sub> <value>` | SDO write (expedited). |
-| `start [-p<pos>]` | Configure the slave + start the cyclic PDO engine (drives to OP). |
-| `stop` | Stop the cyclic PDO engine. |
+| `start [-p<pos>] [-r<hz>]` | Configure the whole bus + start the cyclic PDO engine (drives every slave to OP); `-p` is accepted but ignored (one LRW spans all slaves); `-r` sets 50–8000 Hz. |
+| `stop` | Stop the cyclic PDO engine (walks every drive down to PRE-OP first). |
+| `stats` | Cyclic telemetry: rate, working counter, interrupt latency / jitter, DC sync error. |
+| `monitor [on\|off]` | Stream a compact telemetry line ~every 500 ms (bare = toggle). |
 | `pdos` | List process-data pins (name, image offset, bit length, direction). |
 | `pd [<pin> [<value>]]` | Dump image / read pin / write output pin. |
+| `host` | Pi/LinuxCNC SPI bridge diagnostics (link, watchdog, CRC/seq errors). |
 | `crashlog` / `crashclear` | Show / clear the saved fault/panic context. |
 
 SDO types (expedited, ≤ 4 bytes): `bool`, `int8`, `int16`, `int32`, `uint8`,
@@ -236,13 +270,13 @@ SDO types (expedited, ≤ 4 bytes): `bool`, `int8`, `int16`, `int32`, `uint8`,
 
 While the cyclic engine is running, **bus-mutating** commands (`rescan`,
 `states`, `upload`, `download`, `start`) are rejected — `stop` first.
-`pd` / `pdos` / `slaves` / `status` stay available (they read the image or
-cached topology, not the live bus).
+`pd` / `pdos` / `slaves` / `status` / `stats` / `monitor` / `host` stay available
+(they read the image, cached topology, or telemetry, not the live bus).
 
-> A parallel effort is adding a cycle-rate option to `start` and a cyclic
-> **telemetry / `stats`** view (jitter, DC sync error). Those are described at a
-> high level in [`docs/cli-reference.md`](docs/cli-reference.md#in-progress); the
-> exact syntax there is marked **TODO — verify against the final `cli.rs`**.
+> Cyclic **rate control** (`start -r<hz>`), the **`stats`** telemetry view
+> (interrupt latency / jitter, DC sync error), and the streaming **`monitor`** mode
+> are implemented and hardware-verified (100 Hz – 4 kHz). See the
+> [cyclic rate/telemetry section](docs/cli-reference.md#cyclic-rate-control-telemetry--live-monitoring).
 
 See the full reference with example output:
 [`docs/cli-reference.md`](docs/cli-reference.md).
@@ -266,7 +300,7 @@ crashlog
 [crash] HARDFAULT pc=0x6000A1B2 lr=0x6000A0FF frame_sp=0x20003F80 msp=0x20003F80
 [crash] cfsr=0x00008200 hfsr=0x40000000 bfar=0x00000000 mmfar=0x00000000
 [crash] r0=0x00000000 r1=0x20001234 r2=0x00000004 r3=0x00000000
-[crash] r12=0x00000000 xpsr=0x61000000 send_stage=2
+[crash] r12=0x00000000 xpsr=0x61000000
 ```
 
 Field meanings, the stack-overflow hint, and the on-board LED fault codes are in
@@ -282,6 +316,8 @@ Field meanings, the stack-overflow hint, and the on-board LED fault codes are in
 | [`docs/config-flow.md`](docs/config-flow.md) | How the bus XML + vendor ESI become `generated.rs` (the `BUS` table and `PINS` map), the config structs, and how to retarget a different drive. |
 | [`docs/cli-reference.md`](docs/cli-reference.md) | Every serial command with real example output. |
 | [`docs/serial-monitoring.md`](docs/serial-monitoring.md) | Using `scripts/view_teensy_serial.py` to watch the bring-up and cyclic output live. |
+| [`docs/linuxcnc-spi-bridge.md`](docs/linuxcnc-spi-bridge.md) | The Raspberry Pi / LinuxCNC SPI host-bridge design and its implemented v1 (frame contract, motion look-ahead, CiA-402, safe-state). |
+| [`linuxcnc/README.md`](linuxcnc/README.md) | Building and wiring the LinuxCNC HAL component (`teensy_ecat_bridge`) on the Pi. |
 | [`docs/ethercat-v1-followups.md`](docs/ethercat-v1-followups.md) | Deferred correctness/robustness/test follow-ups from the v1 reviews. |
 | [`docs/pdo-planning-input.md`](docs/pdo-planning-input.md) | Historical planning brief for the PDO feature (IgH mechanics, register cheat-sheet). |
 
@@ -302,10 +338,11 @@ src/
   net/                     RMII ENET driver (raw L2 transport); legacy W5500 SPI (inactive)
   modbus/                  legacy Modbus register map (inactive)
 scripts/
-  generate_ethercat_config.py   bus XML + ESI -> src/ethercat/config/generated.rs
+  generate_ethercat_config.py   bus XML + ESI -> generated.rs + SPI-bridge layout (.rs/.h)
   view_teensy_serial.py         read-only timestamped serial logger
 tools/
   soft_reboot_teensy.py         host-driven reboot / bootloader trigger
+linuxcnc/                  LinuxCNC HAL component for the Pi host bridge (generated layout + C comp)
 ethercat-conf.bohign.xml   the desired bus (lcec/LinuxCNC dialect)
 Bohign_MS_ECAT_V2.5.xml    vendor ESI (device description)
 ```

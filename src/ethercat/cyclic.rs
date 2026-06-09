@@ -5,22 +5,32 @@
 //! the high-priority PIT cyclic task: each tick processes the previous cycle's
 //! reply and sends this cycle's frame (pipelined, allocation-free, no busy-wait).
 //!
-//! Phases: `Priming` cycles the LRW until the slave is exchanging data, then
-//! `RequestingOp` interleaves an AL-control/-status datagram with the LRW (via
-//! the `0x8000` multi-datagram framing) so process data keeps flowing while OP
-//! is requested, then `Operational` (steady single-LRW exchange).
+//! Phases: `Priming` cycles the one whole-bus LRW until data is exchanging, then
+//! `RequestingOp` interleaves per-slave AL-control/-status datagrams with the
+//! LRW (via the `0x8000` multi-datagram framing) so process data keeps flowing
+//! while EACH slave is requested to OP, then `Operational` (steady LRW exchange,
+//! plus continuous DC reference-time distribution + drift/AL monitoring once two
+//! or more slaves are present). One LRW carries all slaves' process data; the
+//! expected working counter scales with the number of slaves (handled by the
+//! `domain`). The single-slave path is the N == 1 special case.
 
 use crate::board::clock_config::CORE_CLOCK_HZ;
+use crate::board::cycle_timer::{self, PERCLK_HZ};
 use crate::ethercat::cia402::{Cia402, DriveCommand};
 use crate::ethercat::datagram::{self, Command};
 use crate::ethercat::device::{Device, ECAT_RX_LEN};
 use crate::ethercat::domain::EcDomain;
-use crate::ethercat::globals::{al_state, reg, EC_FRAME_HEADER_SIZE};
+use crate::ethercat::globals::{al_state, reg, EC_FRAME_HEADER_SIZE, EC_MAX_SLAVES};
 use crate::hal::host_bridge::{HostBridge, ReplyStatus};
-use cortex_m::peripheral::DWT;
+use heapless::Vec;
 
-/// EtherCAT frame buffer for the cyclic LRW (+ optional appended datagram).
-const CYCLIC_BUF: usize = crate::ethercat::domain::MAX_IMAGE + 32;
+/// EtherCAT frame buffer for the cyclic LRW + its appended datagrams. Sized for
+/// the whole-bus image plus the worst-case Operational tail (an ARMW DC-time
+/// distribution + one telemetry read), with margin.
+const CYCLIC_BUF: usize = crate::ethercat::domain::MAX_IMAGE + 64;
+/// Maximum datagrams appended after the LRW in one cycle (Operational multi-
+/// slave appends an ARMW + one telemetry read; the rest are single).
+const MAX_APPENDED: usize = 3;
 /// Consecutive responding cycles (WKC > 0) in `Priming` before requesting OP.
 const PRIMING_CYCLES: u32 = 3;
 /// Consecutive cyclic ticks with a stalled host heartbeat before the host is
@@ -44,14 +54,52 @@ pub enum Phase {
     Faulted,
 }
 
-/// What was appended to the last cyclic frame (to interpret the reply).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+/// One datagram appended after the cyclic LRW, recorded in build order so the
+/// reply walker can dispatch each by kind.
+#[derive(Clone, Copy, Debug)]
 enum Appended {
-    None,
+    /// AL-control write (= OP) to a slave; nothing to decode from the reply.
     Control,
-    Status,
-    /// A DC system-time-difference read (FPRD 0x092C) for sync monitoring.
+    /// AL-status read gating the slave at `idx`'s SAFE-OP -> OP step.
+    Status { idx: usize },
+    /// Continuous DC reference-time distribution (ARMW 0x0910); best-effort.
+    DcArmw,
+    /// DC system-time-difference read (FPRD 0x092C) for drift monitoring.
     DcDiff,
+    /// Operational round-robin AL-status read (catches a slave dropping OP).
+    AlPoll,
+}
+
+/// The decoded effect of one appended reply, applied after the receive-buffer
+/// borrow is released so disjoint engine state can be mutated freely.
+#[derive(Clone, Copy)]
+enum AppliedReply {
+    None,
+    /// Slave `idx` reported OP (during `RequestingOp`).
+    OpReached { idx: usize },
+    /// A slave reported an AL error, or dropped OP while operational.
+    Fault,
+    /// A decoded DC system-time difference (signed ns).
+    Drift(i32),
+}
+
+/// One slave the cyclic engine drives to OP and monitors. Built by the master
+/// from the discovered topology paired with the compile-time bus config.
+#[derive(Clone, Copy)]
+pub struct CyclicSlave {
+    /// Configured station address (the FPRD/FPWR target).
+    pub station: u16,
+    /// Ring position (auto-increment order; identifies the DC reference).
+    pub ring_pos: u16,
+}
+
+/// Per-slave runtime state inside the engine.
+#[derive(Clone, Copy)]
+struct SlaveRt {
+    station: u16,
+    ring_pos: u16,
+    /// Set once this slave's AL status reads OP during `RequestingOp`.
+    reached_op: bool,
 }
 
 /// A snapshot of cyclic health for reporting.
@@ -65,14 +113,15 @@ pub struct CyclicStatus {
     pub rate_hz: u32,
     /// Expected period (us), derived from the period.
     pub period_us: u32,
-    /// Shortest observed tick-to-tick interval (us).
-    pub jitter_min_us: u32,
-    /// Longest observed tick-to-tick interval (us).
-    pub jitter_max_us: u32,
-    /// Worst-case absolute deviation from the expected period (us).
-    pub jitter_worst_us: u32,
-    /// Worst-case absolute deviation from the expected period (core cycles).
-    pub jitter_worst_cyc: u32,
+    /// Best-case (floor) interrupt latency from the PIT fire to the ISR (ns).
+    pub latency_min_ns: u32,
+    /// Worst-case interrupt latency from the PIT fire to the ISR (ns).
+    pub latency_max_ns: u32,
+    /// Scheduling jitter: the latency spread (worst - best), in ns. This is the
+    /// headline metric -- it goes non-zero only when entry is actually delayed.
+    pub jitter_ns: u32,
+    /// Worst-case interrupt latency expressed in core (CPU) cycles.
+    pub latency_max_cyc: u32,
     /// Latest decoded DC system-time difference (signed ns; 0 if never read).
     pub dc_diff_ns: i32,
     /// Largest-magnitude DC system-time difference seen (signed ns).
@@ -84,7 +133,10 @@ pub struct CyclicStatus {
 /// The cyclic process-data engine for one domain.
 pub struct Cyclic {
     domain: EcDomain,
-    station: u16,
+    /// Slaves driven to OP / monitored, in ring order.
+    slaves: Vec<SlaveRt, EC_MAX_SLAVES>,
+    /// Ring position of the DC reference clock (the ARMW auto-increment base).
+    ref_ring_pos: u16,
     phase: Phase,
     tx: [u8; CYCLIC_BUF],
     tx_len: usize,
@@ -93,20 +145,23 @@ pub struct Cyclic {
     expected_index: u8,
     good_cycles: u32,
     total_cycles: u32,
-    appended: Appended,
-    /// Configured cyclic period (ns); drives the jitter baseline + rate report.
+    /// Datagrams appended after the LRW this cycle, in build order.
+    appended: Vec<Appended, MAX_APPENDED>,
+    /// `RequestingOp`: index of the slave currently being driven to OP.
+    op_cursor: usize,
+    /// `RequestingOp`: alternates the AL-control write / AL-status read.
+    op_ctrl_phase: bool,
+    /// `Operational`: alternates the telemetry read between DC drift and a
+    /// round-robin per-slave AL-status poll.
+    mon_toggle: bool,
+    /// `Operational`: rotating slave index for the AL-status poll.
+    mon_cursor: usize,
+    /// Configured cyclic period (ns); drives the rate/period report.
     cycle_ns: u64,
-    /// Expected tick-to-tick interval, in core (DWT CYCCNT) cycles.
-    expected_cyc: u32,
-    /// DWT CYCCNT at the previous tick (for interval measurement).
-    last_tick_cyc: u32,
-    /// False until the first tick establishes a `last_tick_cyc` baseline.
-    have_last_tick: bool,
-    /// Shortest / longest observed tick interval (core cycles; 0 = no samples).
-    min_interval_cyc: u32,
-    max_interval_cyc: u32,
-    /// Worst absolute deviation of an interval from `expected_cyc` (core cycles).
-    worst_dev_cyc: u32,
+    /// Best / worst interrupt latency from the PIT fire (perclk ticks). `min`
+    /// starts at its sentinel until the first tick records a sample.
+    lat_min_ticks: u32,
+    lat_max_ticks: u32,
     /// Latest / largest-magnitude DC system-time difference (signed ns).
     dc_diff_ns: i32,
     dc_diff_max_ns: i32,
@@ -117,18 +172,24 @@ pub struct Cyclic {
 }
 
 impl Cyclic {
-    /// Create the engine for the slave at `station`, built from the compile-time
-    /// bus configuration and running at a `cycle_ns` period. The bring-up FSM has
-    /// already reached SAFE-OP. Telemetry stats start fresh (reset on every
-    /// `start`).
-    pub fn new(station: u16, cycle_ns: u64) -> Self {
-        enable_cycle_counter();
-        // Expected tick interval in core cycles: period_ns * core_hz / 1e9.
-        let expected_cyc =
-            (cycle_ns.saturating_mul(CORE_CLOCK_HZ as u64) / 1_000_000_000) as u32;
+    /// Create the engine for `slaves` (all already at SAFE-OP), with the DC
+    /// reference at ring position `ref_ring_pos`, running at a `cycle_ns`
+    /// period. Built from the compile-time bus configuration; the cyclic engine
+    /// drives every slave the rest of the way to OP. Telemetry stats start fresh
+    /// (reset on every `start`).
+    pub fn new(slaves: &[CyclicSlave], ref_ring_pos: u16, cycle_ns: u64) -> Self {
+        let mut rt = Vec::new();
+        for s in slaves {
+            let _ = rt.push(SlaveRt {
+                station: s.station,
+                ring_pos: s.ring_pos,
+                reached_op: false,
+            });
+        }
         Self {
             domain: EcDomain::from_config(&crate::ethercat::config::generated::BUS),
-            station,
+            slaves: rt,
+            ref_ring_pos,
             phase: Phase::Priming,
             tx: [0; CYCLIC_BUF],
             tx_len: 0,
@@ -137,14 +198,14 @@ impl Cyclic {
             expected_index: 0,
             good_cycles: 0,
             total_cycles: 0,
-            appended: Appended::None,
+            appended: Vec::new(),
+            op_cursor: 0,
+            op_ctrl_phase: true,
+            mon_toggle: true,
+            mon_cursor: 0,
             cycle_ns,
-            expected_cyc,
-            last_tick_cyc: 0,
-            have_last_tick: false,
-            min_interval_cyc: u32::MAX,
-            max_interval_cyc: 0,
-            worst_dev_cyc: 0,
+            lat_min_ticks: u32::MAX,
+            lat_max_ticks: 0,
             dc_diff_ns: 0,
             dc_diff_max_ns: 0,
             dc_valid: false,
@@ -152,10 +213,14 @@ impl Cyclic {
         }
     }
 
-    /// The configured station address of the slave this engine drives. Used by
-    /// `stop` to bring the drive down cleanly before tearing the engine down.
-    pub fn station(&self) -> u16 {
-        self.station
+    /// The configured station addresses this engine drives, in ring order. Used
+    /// by `stop` to bring every drive down cleanly before tearing it down.
+    pub fn stations(&self) -> Vec<u16, EC_MAX_SLAVES> {
+        let mut v = Vec::new();
+        for s in &self.slaves {
+            let _ = v.push(s.station);
+        }
+        v
     }
 
     /// The process-data image (read; inputs are live in OP/SAFE-OP).
@@ -170,8 +235,9 @@ impl Cyclic {
 
     /// A snapshot of cyclic health (process-data + timing/DC telemetry).
     pub fn status(&self) -> CyclicStatus {
-        // No interval recorded yet leaves `min` at its sentinel; report 0 instead.
-        let has_samples = self.max_interval_cyc != 0;
+        // No latency sampled yet leaves `min` at its sentinel; report 0 instead.
+        let min_ticks = if self.lat_min_ticks == u32::MAX { 0 } else { self.lat_min_ticks };
+        let max_ticks = self.lat_max_ticks;
         CyclicStatus {
             phase: self.phase,
             wkc: self.domain.last_wkc(),
@@ -183,10 +249,10 @@ impl Cyclic {
                 0
             },
             period_us: (self.cycle_ns / 1_000) as u32,
-            jitter_min_us: if has_samples { cyc_to_us(self.min_interval_cyc) } else { 0 },
-            jitter_max_us: cyc_to_us(self.max_interval_cyc),
-            jitter_worst_us: cyc_to_us(self.worst_dev_cyc),
-            jitter_worst_cyc: self.worst_dev_cyc,
+            latency_min_ns: ticks_to_ns(min_ticks),
+            latency_max_ns: ticks_to_ns(max_ticks),
+            jitter_ns: ticks_to_ns(max_ticks.saturating_sub(min_ticks)),
+            latency_max_cyc: ticks_to_core_cyc(max_ticks),
             dc_diff_ns: self.dc_diff_ns,
             dc_diff_max_ns: self.dc_diff_max_ns,
             dc_valid: self.dc_valid,
@@ -230,17 +296,17 @@ impl Cyclic {
         host.build_reply(self.domain.image(), st);
     }
 
-    /// Timestamp the tick (jitter accounting) and advance the cycle counter.
+    /// Sample the interrupt latency (jitter accounting) and advance the cycle
+    /// counter. Called first in each tick so the latency read is as close to ISR
+    /// entry as possible.
     fn begin_tick(&mut self) {
-        // Timestamp at ISR entry: the interval between consecutive ticks is the
-        // realized cycle period; its spread vs `expected_cyc` is the jitter.
-        let now = DWT::cycle_count();
-        if self.have_last_tick {
-            self.record_interval(now.wrapping_sub(self.last_tick_cyc));
-        } else {
-            self.have_last_tick = true;
-        }
-        self.last_tick_cyc = now;
+        // Absolute interrupt latency from the PIT hardware fire (LDVAL - CVAL).
+        // Unlike a tick-to-tick interval -- which is always exactly the period
+        // because the PIT and core clocks are synchronous and the WFI wake is
+        // deterministic, hiding all jitter -- this measures the real delay from
+        // the timer firing to this handler running, so its spread exposes
+        // scheduling jitter under load.
+        self.record_latency(cycle_timer::latency_ticks());
         self.total_cycles = self.total_cycles.wrapping_add(1);
     }
 
@@ -303,17 +369,13 @@ impl Cyclic {
         }
     }
 
-    /// Fold one measured tick interval (core cycles) into the jitter stats.
-    fn record_interval(&mut self, interval: u32) {
-        if interval < self.min_interval_cyc {
-            self.min_interval_cyc = interval;
+    /// Fold one interrupt-latency sample (PIT ticks) into the min/max stats.
+    fn record_latency(&mut self, ticks: u32) {
+        if ticks < self.lat_min_ticks {
+            self.lat_min_ticks = ticks;
         }
-        if interval > self.max_interval_cyc {
-            self.max_interval_cyc = interval;
-        }
-        let dev = interval.abs_diff(self.expected_cyc);
-        if dev > self.worst_dev_cyc {
-            self.worst_dev_cyc = dev;
+        if ticks > self.lat_max_ticks {
+            self.lat_max_ticks = ticks;
         }
     }
 
@@ -331,17 +393,39 @@ impl Cyclic {
         }
     }
 
-    /// Parse the reply frame (LRW + optional appended datagram) and update state.
+    /// Parse the reply frame (LRW + any appended datagrams) and update state.
+    /// Each appended datagram is decoded into a Copy `AppliedReply` while the
+    /// receive buffer is borrowed, then applied afterwards so disjoint engine
+    /// state can be mutated without aliasing the `self.rx` borrow.
     fn process(&mut self, len: usize) {
-        let frame = &self.rx[..len];
-        let (lrw, next) = match datagram::parse_at(frame, EC_FRAME_HEADER_SIZE) {
-            Some(v) => v,
-            None => return,
+        // Decode the reply while the receive buffer is borrowed, returning only
+        // owned/Copy values so the borrow ends before disjoint state is mutated.
+        let (lrw_wkc, actions) = {
+            let frame = &self.rx[..len];
+            let (lrw, mut next) = match datagram::parse_at(frame, EC_FRAME_HEADER_SIZE) {
+                Some(v) => v,
+                None => return,
+            };
+            let lrw_wkc = lrw.working_counter;
+            self.domain.apply_reply(&lrw);
+            // Walk the appended datagrams in the exact order they were built.
+            let mut actions: Vec<AppliedReply, MAX_APPENDED> = Vec::new();
+            for &kind in self.appended.iter() {
+                if next == 0 {
+                    break;
+                }
+                let (dg, n2) = match datagram::parse_at(frame, next) {
+                    Some(v) => v,
+                    None => break,
+                };
+                next = n2;
+                let _ = actions.push(decode_appended(kind, &dg));
+            }
+            (lrw_wkc, actions)
         };
-        let wkc = lrw.working_counter;
-        self.domain.apply_reply(&lrw);
 
-        if wkc > 0 {
+        // Process-data health + the Priming -> RequestingOp gate (whole-bus WKC).
+        if lrw_wkc > 0 {
             self.good_cycles = self.good_cycles.saturating_add(1);
         } else {
             self.good_cycles = 0;
@@ -350,89 +434,162 @@ impl Cyclic {
             self.phase = Phase::RequestingOp;
         }
 
-        // Interpret the appended datagram: the AL status during the OP request,
-        // or the DC system-time-difference read while operational. Inlined (not a
-        // helper) so the disjoint-field writes don't conflict with `frame`'s
-        // borrow of `self.rx`. A zero working counter means the appended read did
-        // not reach the slave, so its value is ignored.
-        if next != 0 {
-            match self.appended {
-                Appended::Status => {
-                    if let Some((al, _)) = datagram::parse_at(frame, next) {
-                        let status = al.data.first().copied().unwrap_or(0);
-                        if status & al_state::ERROR != 0 {
-                            self.phase = Phase::Faulted;
-                        } else if status & al_state::MASK == al_state::OP {
-                            self.phase = Phase::Operational;
-                        }
+        // Apply each appended reply's decoded effect. A zero working counter
+        // already decoded to `None`, so a read that did not reach its slave is
+        // ignored rather than faulting the bus.
+        for a in actions.iter() {
+            match *a {
+                AppliedReply::OpReached { idx } => {
+                    if let Some(s) = self.slaves.get_mut(idx) {
+                        s.reached_op = true;
                     }
                 }
-                Appended::DcDiff => {
-                    if let Some((dc, _)) = datagram::parse_at(frame, next) {
-                        if dc.working_counter > 0 && dc.data.len() >= 4 {
-                            let raw =
-                                u32::from_le_bytes([dc.data[0], dc.data[1], dc.data[2], dc.data[3]]);
-                            let diff = decode_dc_diff(raw);
-                            self.dc_diff_ns = diff;
-                            self.dc_valid = true;
-                            if diff.unsigned_abs() > self.dc_diff_max_ns.unsigned_abs() {
-                                self.dc_diff_max_ns = diff;
-                            }
-                        }
+                AppliedReply::Fault => self.phase = Phase::Faulted,
+                AppliedReply::Drift(v) => {
+                    self.dc_diff_ns = v;
+                    self.dc_valid = true;
+                    if v.unsigned_abs() > self.dc_diff_max_ns.unsigned_abs() {
+                        self.dc_diff_max_ns = v;
                     }
                 }
-                _ => {}
+                AppliedReply::None => {}
             }
+        }
+
+        // Enter steady operation only once EVERY slave has reported OP.
+        if self.phase == Phase::RequestingOp && self.all_reached_op() {
+            self.phase = Phase::Operational;
         }
     }
 
-    /// Build and send this cycle's frame (LRW, plus an AL datagram while
-    /// requesting OP).
-    fn send(&mut self, dev: &mut Device, index: &mut u8) {
-        let i = alloc_index(index);
-        self.tx_len = self.domain.build_lrw(&mut self.tx, i);
-        self.expected_index = i;
-        self.appended = Appended::None;
+    /// Whether every driven slave has reported OP.
+    fn all_reached_op(&self) -> bool {
+        self.slaves.iter().all(|s| s.reached_op)
+    }
 
-        if self.phase == Phase::RequestingOp {
-            // Alternate: write AL control = OP, then poll AL status, repeatedly,
-            // all while the LRW keeps process data flowing.
-            let ai = alloc_index(index);
-            if self.good_cycles % 2 == 0 {
-                self.tx_len = datagram::append(
-                    &mut self.tx,
-                    ai,
-                    Command::Fpwr,
-                    self.station,
-                    reg::AL_CONTROL,
-                    &[al_state::OP, 0],
-                );
-                self.appended = Appended::Control;
-            } else {
-                self.tx_len = datagram::append(
-                    &mut self.tx,
-                    ai,
-                    Command::Fprd,
-                    self.station,
-                    reg::AL_STATUS,
-                    &[0u8, 0u8],
-                );
-                self.appended = Appended::Status;
-            }
-        } else if self.phase == Phase::Operational {
-            // Interleave a DC system-time-difference read (FPRD 0x092C) into the
-            // OP frame, alongside the LRW, so sync drift is monitored without a
-            // separate transaction disturbing the cycle timing.
-            let ai = alloc_index(index);
+    /// The station of a non-reference slave -- where the 0x092C system-time
+    /// difference reflects real drift from the distributed reference time. Falls
+    /// back to the first slave if only the reference is present.
+    fn follower_station(&self) -> u16 {
+        self.slaves
+            .iter()
+            .find(|s| s.ring_pos != self.ref_ring_pos)
+            .or_else(|| self.slaves.first())
+            .map(|s| s.station)
+            .unwrap_or(0)
+    }
+
+    /// During `RequestingOp`, append one per-slave AL datagram: walk to the next
+    /// slave still short of OP, then alternate an AL-control write (= OP) with an
+    /// AL-status read, mirroring the v1 single-slave handshake per slave. All the
+    /// while the LRW keeps process data flowing.
+    fn append_op_request(&mut self, index: &mut u8) {
+        while self.op_cursor < self.slaves.len() && self.slaves[self.op_cursor].reached_op {
+            self.op_cursor += 1;
+            self.op_ctrl_phase = true;
+        }
+        let idx = self.op_cursor;
+        let station = match self.slaves.get(idx) {
+            Some(s) => s.station,
+            None => return, // all reached OP; the next `process` enters Operational
+        };
+        let ai = alloc_index(index);
+        if self.op_ctrl_phase {
+            self.tx_len = datagram::append(
+                &mut self.tx,
+                ai,
+                Command::Fpwr,
+                station,
+                reg::AL_CONTROL,
+                &[al_state::OP, 0],
+            );
+            let _ = self.appended.push(Appended::Control);
+        } else {
             self.tx_len = datagram::append(
                 &mut self.tx,
                 ai,
                 Command::Fprd,
-                self.station,
+                station,
+                reg::AL_STATUS,
+                &[0u8, 0u8],
+            );
+            let _ = self.appended.push(Appended::Status { idx });
+        }
+        self.op_ctrl_phase = !self.op_ctrl_phase;
+    }
+
+    /// During `Operational`, append the monitoring tail. A single slave is its
+    /// own DC reference, so only its drift read is meaningful (byte-identical to
+    /// the v1 frame). With two or more slaves, first distribute the reference DC
+    /// time to the followers (ARMW reads 0x0910 at the reference and writes it to
+    /// every other slave so they stay disciplined and 0x092C reflects real
+    /// drift), then alternate a follower drift read with a round-robin AL-status
+    /// poll so a slave dropping OP is caught.
+    fn append_monitor(&mut self, index: &mut u8) {
+        if self.slaves.len() <= 1 {
+            if let Some(s) = self.slaves.first() {
+                let ai = alloc_index(index);
+                self.tx_len = datagram::append(
+                    &mut self.tx,
+                    ai,
+                    Command::Fprd,
+                    s.station,
+                    reg::DC_SYS_TIME_DIFF,
+                    &[0u8; 4],
+                );
+                let _ = self.appended.push(Appended::DcDiff);
+            }
+            return;
+        }
+
+        // Continuous DC reference-time distribution (ARMW @ 0x0910).
+        let ai = alloc_index(index);
+        let adp = datagram::autoinc_adp(self.ref_ring_pos);
+        self.tx_len =
+            datagram::append(&mut self.tx, ai, Command::Armw, adp, reg::DC_SYS_TIME, &[0u8; 8]);
+        let _ = self.appended.push(Appended::DcArmw);
+
+        // Telemetry: alternate a follower drift read with a per-slave AL poll.
+        let ti = alloc_index(index);
+        if self.mon_toggle {
+            let station = self.follower_station();
+            self.tx_len = datagram::append(
+                &mut self.tx,
+                ti,
+                Command::Fprd,
+                station,
                 reg::DC_SYS_TIME_DIFF,
                 &[0u8; 4],
             );
-            self.appended = Appended::DcDiff;
+            let _ = self.appended.push(Appended::DcDiff);
+        } else {
+            self.mon_cursor = (self.mon_cursor + 1) % self.slaves.len();
+            let station = self.slaves[self.mon_cursor].station;
+            self.tx_len = datagram::append(
+                &mut self.tx,
+                ti,
+                Command::Fprd,
+                station,
+                reg::AL_STATUS,
+                &[0u8, 0u8],
+            );
+            let _ = self.appended.push(Appended::AlPoll);
+        }
+        self.mon_toggle = !self.mon_toggle;
+    }
+
+    /// Build and send this cycle's frame (the whole-bus LRW, plus per-slave AL
+    /// datagrams while requesting OP, or the DC/AL monitoring tail in OP).
+    fn send(&mut self, dev: &mut Device, index: &mut u8) {
+        let i = alloc_index(index);
+        self.tx_len = self.domain.build_lrw(&mut self.tx, i);
+        self.expected_index = i;
+        self.appended.clear();
+
+        if self.phase == Phase::RequestingOp {
+            self.append_op_request(index);
+        } else if self.phase == Phase::Operational {
+            self.append_monitor(index);
         }
 
         self.outstanding = dev.send(&self.tx[..self.tx_len]).is_ok();
@@ -446,21 +603,62 @@ fn alloc_index(index: &mut u8) -> u8 {
     i
 }
 
-/// Convert a duration in core (DWT CYCCNT) cycles to microseconds.
+/// Convert a duration in PIT ticks (perclk domain) to nanoseconds. PERCLK is
+/// the 24 MHz crystal oscillator, so one tick is 1e9 / 24e6 ≈ 41.7 ns.
 #[inline]
-fn cyc_to_us(cyc: u32) -> u32 {
-    (cyc as u64 * 1_000_000 / CORE_CLOCK_HZ as u64) as u32
+fn ticks_to_ns(ticks: u32) -> u32 {
+    (ticks as u64 * 1_000_000_000 / PERCLK_HZ as u64) as u32
 }
 
-/// Enable the DWT cycle counter (CYCCNT) for cycle-accurate jitter timing.
-/// Idempotent, so it is safe to call on every `start`.
-fn enable_cycle_counter() {
-    // SAFETY: single-core MCU. DWT/DCB are not driven anywhere else, and
-    // enabling the cycle counter is idempotent, so stealing the core
-    // peripherals here cannot disturb another owner.
-    let mut core = unsafe { cortex_m::Peripherals::steal() };
-    core.DCB.enable_trace();
-    core.DWT.enable_cycle_counter();
+/// Convert a duration in PIT ticks (perclk domain) to core (CPU) cycles by the
+/// clock ratio, so the jitter can be read in the same units as the CPU budget.
+#[inline]
+fn ticks_to_core_cyc(ticks: u32) -> u32 {
+    (ticks as u64 * CORE_CLOCK_HZ as u64 / PERCLK_HZ as u64) as u32
+}
+
+/// Decode one appended reply into the effect to apply after the receive-buffer
+/// borrow ends. A zero working counter (the datagram never reached its slave)
+/// always decodes to `None`, so a dropped read can never fault the bus.
+fn decode_appended(kind: Appended, dg: &datagram::Reply<'_>) -> AppliedReply {
+    match kind {
+        // Writes / best-effort time distribution carry nothing to interpret.
+        Appended::Control | Appended::DcArmw => AppliedReply::None,
+        Appended::Status { idx } => {
+            if dg.working_counter == 0 {
+                return AppliedReply::None;
+            }
+            let status = dg.data.first().copied().unwrap_or(0);
+            if status & al_state::ERROR != 0 {
+                AppliedReply::Fault
+            } else if status & al_state::MASK == al_state::OP {
+                AppliedReply::OpReached { idx }
+            } else {
+                AppliedReply::None
+            }
+        }
+        Appended::AlPoll => {
+            // Operational health: a slave that responded but is no longer OP
+            // faults the engine, mirroring the single-slave Faulted semantics.
+            if dg.working_counter == 0 {
+                return AppliedReply::None;
+            }
+            let status = dg.data.first().copied().unwrap_or(0);
+            if status & al_state::ERROR != 0 || status & al_state::MASK != al_state::OP {
+                AppliedReply::Fault
+            } else {
+                AppliedReply::None
+            }
+        }
+        Appended::DcDiff => {
+            if dg.working_counter > 0 && dg.data.len() >= 4 {
+                let raw = u32::from_le_bytes([dg.data[0], dg.data[1], dg.data[2], dg.data[3]]);
+                AppliedReply::Drift(decode_dc_diff(raw))
+            } else {
+                AppliedReply::None
+            }
+        }
+    }
 }
 
 /// Decode ESC register 0x092C (system-time difference) into a signed nanosecond

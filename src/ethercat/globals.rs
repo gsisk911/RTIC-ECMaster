@@ -83,12 +83,19 @@ pub mod reg {
     pub const SM0_STATUS: u16 = 0x0805;
     /// Sync-manager 1 status byte (page 1 + 5); mailbox-full bit lives here.
     pub const SM1_STATUS: u16 = 0x080D;
-    /// DC receive-time latch / per-port receive times.
+    /// DC receive-time latch / per-port receive times. A write (BWR/FPWR) latches
+    /// each port's local receive time into the four 32-bit words at
+    /// 0x0900/0x0904/0x0908/0x090C; a read returns the latched values.
     pub const DC_RECV_TIME: u16 = 0x0900;
-    /// DC system time.
+    /// DC local system time (U64, ns) - 0x0910. Read returns local time + offset.
     pub const DC_SYS_TIME: u16 = 0x0910;
-    /// DC system time offset + transmission delay.
+    /// DC system-time offset (U64, ns) - 0x0920. Added to the local time to form
+    /// the local copy of the reference system time; written to remove the bulk
+    /// (clock-start) offset between a follower and the reference clock.
     pub const DC_SYS_TIME_OFFSET: u16 = 0x0920;
+    /// DC system-time transmission delay (U32, ns) - 0x0928. Propagation delay
+    /// from the reference clock to this slave; refines the offset to sub-us.
+    pub const DC_SYS_TIME_DELAY: u16 = 0x0928;
     /// DC system-time difference (drift; magnitude + sign bit, ns) - 0x092C.
     pub const DC_SYS_TIME_DIFF: u16 = 0x092C;
     /// DC activation register (the `assignActivate` word, e.g. 0x0300) - 0x0980.

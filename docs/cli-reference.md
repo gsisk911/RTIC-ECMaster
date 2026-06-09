@@ -19,9 +19,10 @@ For how to connect a terminal and watch the output, see
   backspace/delete edit the current line.
 - **Numbers are base-from-prefix:** `0x…` hex, `0b…` binary, otherwise decimal.
   This applies to indices, subindices, values, and `pd` values.
-- **All responses are prefixed** `[ecat]`, `[scan]`, or `[crash]`.
-- **On USB attach** the firmware prints a one-time banner, and after a scan
-  completes, a one-time scan summary. Otherwise it only speaks when spoken to.
+- **All responses are prefixed** `[boot]`, `[ecat]`, `[scan]`, `[crash]`, `[host]`,
+  or `[mon]`.
+- **On USB attach** the firmware prints a one-time banner. Otherwise it only speaks
+  when spoken to — the bus is **not** auto-scanned at boot, so run `rescan` first.
 
 ```text
 [boot] teensy-rust-modbus-base 0.1.0 (v0.1.0-g1a2b3c4)
@@ -39,8 +40,9 @@ rescan
 ```
 
 Rejected while running: `rescan`, `states`, `upload`, `download`, `start`. Still
-available: `pd`, `pdos`, `slaves`, `status` (they read the image or cached
-topology, not the live bus). Use `stop` first to run a bus command.
+available: `pd`, `pdos`, `slaves`, `status`, `stats`, `monitor`, `host` (they read
+the image, cached topology, or telemetry — not the live bus). Use `stop` first to
+run a bus command.
 
 ---
 
@@ -58,10 +60,13 @@ Prints the command list:
   states -p<pos> <INIT|PREOP|SAFEOP|OP>    request an AL state
   upload -p<pos> -t<type> <idx> <sub>      SDO read (0x.. hex, else decimal)
   download -p<pos> -t<type> <idx> <sub> <value>   SDO write
-  start [-p<pos>]                          configure + start cyclic PDO (to OP)
+  start [-p<pos>] [-r<hz>]                 configure + start cyclic PDO (50..8000 Hz)
   stop                                     stop cyclic PDO
+  stats                                    cyclic rate, jitter, DC sync error
+  monitor [on|off]                         stream stats ~every 500ms (bare = toggle)
   pdos                                     list process-data pins and offsets
   pd [<pin> [<value>]]                     dump image / read pin / write pin
+  host                                     Pi/LinuxCNC SPI bridge diagnostics
   crashlog                                 show the saved fault/panic context
   crashclear                               clear the saved fault/panic context
   types: bool int8 int16 int32 uint8 uint16 uint32
@@ -73,13 +78,15 @@ List the slaves discovered by the last scan (cached; does not touch the bus).
 
 ```text
 slaves
-[ecat] 1 slave(s)
+[ecat] 2 slave(s)
 [ecat] slave 0 station=1 vid=0x00000994 pid=0x00001B00 al=0x01 coe=yes
+[ecat] slave 1 station=2 vid=0x00000994 pid=0x00001B00 al=0x01 coe=yes
 ```
 
 Fields: ring position, station address (`= position + 1`), vendor ID, product
 code, AL-status byte (`0x01`=INIT, `0x02`=PRE-OP, `0x04`=SAFE-OP, `0x08`=OP), and
-CoE support. Empty until you `rescan`.
+CoE support. Empty until you `rescan`. The committed bus is two identical drives,
+so both rows show the same vendor/product.
 
 ### `status` (alias `info`)
 
@@ -88,13 +95,14 @@ Firmware tag, PHY link state, slave count, and (if running) the cyclic snapshot.
 ```text
 status
 [ecat] fw 0.1.0 (v0.1.0-g1a2b3c4)
-[ecat] link=up slaves=1
-[ecat] cyclic OP wkc=3/3 cycles=128407
+[ecat] link=up slaves=2
+[ecat] cyclic OP 100Hz wkc=6/6 cycles=128407 ('stats' for detail)
 ```
 
-The third line appears only while the cyclic engine runs. `wkc=3/3` is
-observed/expected working counter; phase is `priming`, `requesting-op`, `OP`, or
-`faulted`.
+The third line appears only while the cyclic engine runs. It carries the cyclic
+rate, `wkc=6/6` (observed/expected working counter — `+3` per drive, so two drives
+expect `6`), and the cycle count; the phase is `priming`, `requesting-op`, `OP`, or
+`faulted`. Use `stats` for latency/jitter + DC.
 
 ### `rescan`
 
@@ -103,10 +111,8 @@ primary no-SWD diagnostic). Must be run before `start`.
 
 ```text
 rescan
-[scan] rescan: start
-[scan] rescan: begun (FSM built)
 [scan] counting slaves
-[scan] count=1
+[scan] count=2
 [scan] addresses cleared
 [scan] s1: addr set
 [scan] s1: al=0x01
@@ -117,11 +123,21 @@ rescan
 [scan] s1: rxmbox off=0x1000 sz=128
 [scan] s1: txmbox off=0x1080 sz=128
 [scan] s1: proto=0x0004 coe=1
-[ecat] rescan complete: 1 slave(s); type 'slaves'
+[scan] s2: addr set
+[scan] s2: al=0x01
+[scan] s2: base type=0x05 fmmu=3 sm=4
+[scan] s2: vendor=0x00000994
+[scan] s2: product=0x00001B00
+[scan] s2: rev=0x00000001
+[scan] s2: rxmbox off=0x1000 sz=128
+[scan] s2: txmbox off=0x1080 sz=128
+[scan] s2: proto=0x0004 coe=1
+[ecat] rescan complete: 2 slave(s); type 'slaves'
 ```
 
-`s1` is the station address. On failure a line like
-`[ecat] error: working counter` (or another `EcError`) ends the stream.
+`s1`/`s2` are the station addresses (ring position + 1), streamed per slave in ring
+order. On failure a line like `[ecat] error: working counter` (or another
+`EcError`) ends the stream.
 
 ### `states -p<pos> <INIT|PREOP|SAFEOP|OP>` (alias `state`)
 
@@ -175,28 +191,31 @@ download -p0 -tint8 0x6060 0 8
 
 ### `start [-p<pos>] [-r<hz>]`
 
-Run the full per-slave bring-up (INIT → SAFE-OP: clears FMMUs/DC, configures
-mailbox + process-data SMs, applies SDO init values, writes PDO assignment +
-mapping over CoE, sets the watchdog and FMMUs, brings up DC SYNC0), then start the
-PIT cyclic engine, which drives the slave to OP. `-p` defaults to `0`. The optional
-`-r<hz>` sets the cyclic rate (50 – 8000 Hz; default = the compile-time rate) — see
+Bring up the **whole configured bus** and start cyclic process data. It runs the
+full per-slave bring-up (INIT → SAFE-OP: clears FMMUs/DC, configures mailbox +
+process-data SMs, applies SDO init values, writes PDO assignment + mapping over
+CoE, sets the watchdog and FMMUs, brings up DC SYNC0) on **every** configured slave
+in ring order, then starts the PIT cyclic engine, which drives them all to OP. One
+LRW spans all slaves, so `-p` is **accepted but ignored** — it no longer selects a
+subset. The optional `-r<hz>` sets the cyclic rate (50 – 8000 Hz; default = the
+compile-time rate) — see
 [Cyclic rate control](#cyclic-rate-control-telemetry--live-monitoring). Requires a
 prior `rescan`.
 
 ```text
-start -p0 -r1000
-[ecat] slave 0 configured; cyclic PDO started at 1000 Hz
+start -r1000
+[ecat] 2 slave(s) configured; cyclic PDO started at 1000 Hz
 ```
 
 If already running: `[ecat] cyclic already running; 'stop' first`. Confirm OP with
-`status` (`cyclic OP 1000Hz wkc=3/3`).
+`status` (`cyclic OP 1000Hz wkc=6/6`).
 
 ### `stop`
 
 Stop the PIT timer and the cyclic engine, releasing the bus for other commands.
-The drive is first brought cleanly down to PRE-OP, so its output watchdog never
-latches an AL error — repeated `start → stop → start` needs no manual `states
-INIT` between cycles.
+**Every** drive is first walked cleanly down to PRE-OP (in ring order), so no
+slave's output watchdog latches an AL error — repeated `start → stop → start` needs
+no manual `states INIT` between cycles.
 
 ```text
 stop
@@ -210,29 +229,39 @@ offset, bit position, and bit length.
 
 ```text
 pdos
-[ecat] 17 process-data pins:
+[ecat] 34 process-data pins:
 [ecat] OUT drive0-controlword off=0 bit=0 len=16
 [ecat] OUT drive0-target-position off=2 bit=0 len=32
 [ecat] OUT drive0-target-velocity off=6 bit=0 len=32
 ...
-[ecat] IN  drive0-statusword off=18 bit=0 len=16
-[ecat] IN  drive0-actual-position off=20 bit=0 len=32
+[ecat] OUT drive1-controlword off=16 bit=0 len=16
+...
+[ecat] IN  drive0-statusword off=34 bit=0 len=16
+[ecat] IN  drive0-actual-position off=36 bit=0 len=32
+...
+[ecat] IN  drive1-statusword off=73 bit=0 len=16
 ...
 ```
 
-`OUT` = master → drive (RxPDO); `IN ` = drive → master (TxPDO).
+`OUT` = master → drive (RxPDO); `IN ` = drive → master (TxPDO). All outputs come
+first (drive0 `0..16`, drive1 `16..32`), then all inputs (drive0 `32..71`, drive1
+`71..110`), so the two drives' pins share the same `driveN-` shape at stacked
+offsets.
 
 ### `pd [<pin> [<value>]]`
 
 The process-data accessor. Three forms:
 
-**No argument — dump the image + cyclic status** (up to 64 bytes, 16 per row):
+**No argument — dump the whole process image + cyclic status** (16 bytes per row;
+110 B for the two-drive bus). Bytes `0..16` are drive0 outputs, `16..32` drive1
+outputs, then the inputs:
 
 ```text
 pd
-[ecat] cyclic OP wkc=3/3 cycles=128511
+[ecat] cyclic OP wkc=6/6 cycles=128511
 [ecat] 0000: 0F 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
-[ecat] 0010: 00 00 37 02 A1 B2 0C 00 ...
+[ecat] 0010: 0F 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+[ecat] 0020: 00 00 37 02 A1 B2 0C 00 ...
 ```
 
 **One argument — read a named pin** (signed-aware; shown decimal + hex):
@@ -318,7 +347,7 @@ crashlog
 [crash] HARDFAULT pc=0x6000A1B2 lr=0x6000A0FF frame_sp=0x20003F80 msp=0x20003F80
 [crash] cfsr=0x00008200 hfsr=0x40000000 bfar=0x00000000 mmfar=0x00000000
 [crash] r0=0x00000000 r1=0x20001234 r2=0x00000004 r3=0x00000000
-[crash] r12=0x00000000 xpsr=0x61000000 send_stage=2
+[crash] r12=0x00000000 xpsr=0x61000000
 ```
 
 A panic instead prints `[crash] PANIC <message>`. If the stack pointer / frame /
@@ -331,8 +360,9 @@ is appended. Full field meanings and the LED fault codes are in
 ## Cyclic rate control, telemetry & live monitoring
 
 These extend `start`/`status` for running and observing the cyclic engine across
-rates. All three are implemented and hardware-verified (100 Hz – 4 kHz, wkc 3/3,
-216 k+ cycles soaked at 4 kHz with zero faults).
+rates. All three are implemented and hardware-verified (100 Hz – 4 kHz): two drives
+reach OP at `wkc = 6/6` at both 100 Hz and 4 kHz, and an earlier single-drive run
+soaked 216 k+ cycles at 4 kHz (`wkc = 3/3`) with zero faults.
 
 ### `start [-p<pos>] [-r<hz>]` — rate control
 
@@ -345,13 +375,13 @@ compile-time `BUS.cycle_ns`.
 - **Default:** the configured rate (currently 100 Hz) when `-r` is omitted.
 
 ```text
-start -p0 -r4000
-[ecat] slave 0 configured; cyclic PDO started at 4000 Hz
+start -r4000
+[ecat] 2 slave(s) configured; cyclic PDO started at 4000 Hz
 ```
 
-`stop` now brings the drive cleanly down to PRE-OP first, and the bring-up FSM
-acknowledges a latched AL error (writes AL Control `0x0120` with the ack bit), so
-repeated `start → stop → start` cycles work with **no manual `states INIT`**
+`stop` now brings **every** drive cleanly down to PRE-OP first, and the bring-up
+FSM acknowledges a latched AL error (writes AL Control `0x0120` with the ack bit),
+so repeated `start → stop → start` cycles work with **no manual `states INIT`**
 between them (the SM2 output watchdog no longer latches an AL `0x001B` error).
 
 ### `stats` — cyclic telemetry (one-shot)
@@ -361,20 +391,33 @@ Reports the engine's timing/health beyond `status`. Allowed while running.
 ```text
 stats
 [ecat] cyclic OP rate=4000Hz period=250us cycles=216748
-[ecat] wkc=3/3
-[ecat] jitter min=250us max=250us worst=0us (0 cyc)
-[ecat] dc-sync latest=0ns max=0ns
+[ecat] wkc=6/6
+[ecat] latency min=500ns max=500ns jitter=0ns (worst 300 cyc)
+[ecat] dc-sync latest=-118ns max=140ns
 ```
 
-- **jitter** — tick-to-tick interval measured from the DWT cycle counter at PIT-ISR
-  entry: shortest/longest interval and the worst absolute deviation from the
-  expected period (µs and core cycles). `0` on a quiescent board is expected and
-  correct — the highest-priority PIT task wakes the CPU from WFI with deterministic
-  latency, and the PIT/core clocks are synchronous.
-- **dc-sync** — the slave's DC system-time difference (ESC register `0x092C`),
-  decoded to signed ns (latest + largest magnitude). `0 ns` with a **single** drive
-  is correct: that drive is the DC reference clock. Prints `dc-sync n/a (no reading
-  yet)` until the first read. Drift becomes meaningful with 2+ slaves.
+- **latency** — the **absolute interrupt latency**: the delay from the PIT hardware
+  fire to the cyclic ISR actually running, read at ISR entry from the PIT
+  down-counter (`LDVAL − CVAL`). The line reports `min` / `max` (ns), the
+  **jitter** = `max − min` (the headline number), and the worst-case latency in
+  core cycles. On a lightly-loaded board it sits ~**500 ns flat** (≈300 core cycles
+  at 600 MHz): the PIT is the highest-priority interrupt, so the only thing that can
+  defer entry is a lower-priority section briefly holding the master lock (whose
+  priority ceiling masks the cyclic IRQ) — e.g. the worker's MDIO link read during
+  `status` — which rarely coincides with a fire. Jitter therefore reads ≈0 when idle
+  and **rises under sustained load** (e.g. the SPI host bridge). This replaces the
+  old tick-to-tick interval, which was always exactly the period (the PIT/core
+  clocks are synchronous and the WFI wake is deterministic, hiding all jitter).
+- **dc-sync** — a follower's DC system-time difference (ESC register `0x092C`),
+  decoded to signed ns (latest + largest magnitude). With **2+ slaves** the master
+  distributes the reference DC time every cycle (an ARMW of `0x0910`
+  auto-increment-addressed at the reference slave), so this is **real follower
+  drift**: it converges under the correction to ≈0.9 ms residual at 100 Hz,
+  tightening to **±~140 ns at 4 kHz** (a faster correction rate = tighter sync). The
+  remaining **static** delay/offset compensation (`0x0900` → `0x0920`) is deferred,
+  which is why the low-rate residual is still large. With a single slave it reads
+  `0 ns` (that drive is its own reference). Prints `dc-sync n/a (no reading yet)`
+  until the first read.
 
 ### `monitor [on|off]` — live streaming telemetry
 
@@ -387,8 +430,8 @@ the priority-3 cyclic tick or holds the master lock longer than `stats`.
 ```text
 monitor on
 [ecat] monitor on (auto-stats ~500ms)
-[mon] 4000Hz cyc=216748 wkc=3/3 jit=0us dc=0ns
-[mon] 4000Hz cyc=218748 wkc=3/3 jit=0us dc=0ns
+[mon] 4000Hz cyc=216748 wkc=6/6 jit=0ns dc=-118ns
+[mon] 4000Hz cyc=218748 wkc=6/6 jit=0ns dc=-122ns
 ```
 
 Emission is independent of who is connected (it keeps streaming after you

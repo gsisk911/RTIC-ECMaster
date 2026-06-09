@@ -53,7 +53,7 @@ The systematic adaptations from a Linux kernel module to a bare-metal RTIC app:
 | `cyclic.rs` | the cyclic half of `master/master.c` | The PIT-tick process-data engine + SAFE-OP → OP gating. |
 | `config/{model,generated}.rs` | (project addition) | Compile-time bus config (see [`config-flow.md`](config-flow.md)). |
 | `cli.rs` | `tool/` (`ethercat` CLI) | Serial line parser → master `Request`s (interface layer, not an IgH `master/` file). |
-| `cia402.rs` | (not IgH core) | CiA-402 drive state machine (scaffolding; app/interface layer). |
+| `cia402.rs` | (not IgH core) | CiA-402 drive sequencer (Switch-On-Disabled → Operation-Enabled + fault-reset/quick-stop), driven each cyclic tick on the host-bridge path; app/interface layer. |
 
 > `fsm_master.rs` / `fsm_slave_scan.rs` retain a blocking `scan_bus` path
 > (`Device::transact`), but the **live** scan path (`rescan`, and the scan you
@@ -140,10 +140,13 @@ pub fn poll_op(&mut self) -> Option<Result<Outcome, EcError>> {
 ```
 
 `Op` variants: `Rescan { ScanFsm }`, `State { PreOp }`, `Sdo { PreOp, FsmCoe, … }`,
-`StartCyclic { FsmSlaveConfig }`, `StopCyclic`. (`PreOp` is a small helper that
-configures the mailbox SMs then runs `FsmChange`, used for `states` and the SDO
-pre-bring-up.) Because the master lives in one static cell, the large `Op` enum is
-a one-time static cost rather than a per-call allocation.
+`StartCyclic { ConfigSeq, cycle_ns }` (a sequencer that runs one `FsmSlaveConfig`
+per configured slave → SAFE-OP, collecting each slave's station + ring position for
+the cyclic engine), `StopCyclic { DownSeq }` (walks every cyclic slave down to
+PRE-OP before the engine is dropped). (`PreOp` is a small helper that configures
+the mailbox SMs then runs `FsmChange`, used for `states` and the SDO pre-bring-up.)
+Because the master lives in one static cell, the large `Op` enum is a one-time
+static cost rather than a per-call allocation.
 
 ### 2.4 The cooperative driver in `main.rs`
 
@@ -198,8 +201,11 @@ working-counter checks reject a partial response rather than fabricate a
 ## 4. Per-slave bring-up (`fsm_slave_config.rs`)
 
 `FsmSlaveConfig` walks one slave from INIT to **SAFE-OP**, composing the smaller
-FSMs. It is the `Op::StartCyclic` body. Phase order (each issues one or more
-datagrams via `Device::pump`):
+FSMs. The `Op::StartCyclic` body is the `ConfigSeq` sequencer, which runs one
+`FsmSlaveConfig` per configured slave (in ring order) so the whole bus reaches
+SAFE-OP before the cyclic engine starts; `stop`'s `DownSeq` is the mirror that
+walks every slave back down to PRE-OP. Phase order for one slave (each issues one or
+more datagrams via `Device::pump`):
 
 ```text
 ClearFmmus    FPWR 0x0600  zero all FMMU pages
@@ -228,9 +234,15 @@ until it is receiving valid process-data frames.
 
 ## 5. Distributed Clocks SYNC0 (`dc.rs`)
 
-`FsmDc` brings up SYNC0 for one slave. v1 targets a single drive that is its own
-reference clock, so cross-slave offset/drift compensation (ARMW/FRMW, register
-`0x092C`) is **not** performed. States:
+`FsmDc` brings up SYNC0 for **one** slave; the bring-up sequencer (`ConfigSeq`,
+§4) runs it once per configured slave. Cross-slave clock discipline is split in
+two: the **continuous** reference-time *distribution* (an ARMW of `0x0910` each
+cycle) is done by the cyclic engine once two or more slaves are present (§6.2),
+and the cyclic engine also *reads* the system-time-difference register (`0x092C`)
+from a follower each cycle for the `stats` DC-sync telemetry. Only the **static**
+delay/offset *compensation* (measuring per-port receive times `0x0900` and writing
+per-slave offsets `0x0920`) is still **deferred** — so low-rate residual drift is
+larger until it lands. The per-slave SYNC0 states below are unchanged:
 
 ```text
 LatchTime   FPWR 0x0900  latch the drive's local time
@@ -244,7 +256,7 @@ Done
 The start time is placed `START_MARGIN_NS = 100 ms` in the future and rounded up
 to a cycle boundary (plus the configured `sync0Shift`), so SYNC0 activation has
 settled on the drive before the first pulse. The DC start-time math is the
-highest-risk part of the bring-up; it is verified working at 100 Hz.
+highest-risk part of the bring-up; it is verified working from 100 Hz to 4 kHz.
 
 ---
 
@@ -257,7 +269,7 @@ highest-risk part of the bring-up; it is verified working at 100 Hz.
 from the compile-time `BUS`:
 
 - **Expected WKC** = `outputs × 2 + inputs` per FMMU (a slave with SM2 + SM3
-  contributes `+3`). For the v1 single drive that is `3`.
+  contributes `+3`). The committed two-drive bus expects `6`.
 - `build_lrw(buf, index)` builds one **LRW** datagram covering the whole image at
   logical address 0.
 - `apply_reply(reply)` copies **only the input ranges** back into the image (so
@@ -270,12 +282,22 @@ from the compile-time `BUS`:
 this cycle's frame). Phases:
 
 ```text
-Priming      cycle the LRW until the slave responds (WKC>0) for PRIMING_CYCLES (3)
-RequestingOp keep the LRW flowing while interleaving an AL-control(=OP) / AL-status
-             datagram in the SAME frame (the 0x8000 "more datagrams follow" bit),
-             so process data never stops while OP is requested
-Operational  steady single-LRW exchange in OP
-Faulted      the drive rejected OP (AL error); keep cycling so it holds SAFE-OP
+Priming      cycle the whole-bus LRW until data is exchanging (WKC>0) for
+             PRIMING_CYCLES (3)
+RequestingOp keep the LRW flowing while interleaving a per-slave AL-control(=OP) /
+             AL-status datagram in the SAME frame (the 0x8000 "more datagrams
+             follow" bit), so process data never stops while EACH slave is walked
+             to OP; the engine advances to Operational only once every slave reports
+             OP (per-slave AL gating)
+Operational  steady whole-bus OP exchange. With a single slave: the LRW plus an
+             appended DC system-time-difference read (FPRD 0x092C). With 2+ slaves:
+             the LRW, plus a continuous DC reference-time distribution (ARMW 0x0910,
+             auto-increment-addressed at the reference slave) each cycle, then an
+             alternating follower DC-diff read (FPRD 0x092C) / round-robin per-slave
+             AL-status poll — feeding the `stats` DC-sync telemetry and catching a
+             slave that drops OP
+Faulted      a slave rejected OP / dropped OP (AL error); keep cycling so the bus
+             holds SAFE-OP
 ```
 
 `tick(dev, index)` is what the high-priority PIT task calls each period:
@@ -283,7 +305,7 @@ Faulted      the drive rejected OP (AL error); keep cycling so it holds SAFE-OP
 ```rust
 // cyclic.rs (shape)
 pub fn tick(&mut self, dev: &mut Device, index: &mut u8) {
-    self.total_cycles += 1;
+    self.begin_tick();                                                   // sample interrupt latency, ++cycle
     if self.outstanding { self.receive(dev); self.outstanding = false; } // last reply
     self.send(dev, index);                                               // this frame
 }
@@ -291,14 +313,43 @@ pub fn tick(&mut self, dev: &mut Device, index: &mut u8) {
 
 `receive` matches the reply by index and walks the (possibly multi-) datagram
 frame with `datagram::parse_at`; during `RequestingOp` it reads the appended AL
-status to detect OP or an AL error. `send` builds the LRW and, while requesting
-OP, appends an alternating AL-control / AL-status datagram. Everything on this
-path is allocation-free and never busy-waits.
+status to detect **each** slave reaching OP or an AL error, and in `Operational` it
+decodes the appended follower DC-diff read (the best-effort reference-time ARMW
+carries nothing to interpret). `send` builds the whole-bus LRW and appends, per
+cycle, an alternating per-slave AL-control / AL-status datagram while requesting OP,
+or — in OP — the DC reference-time ARMW (`0x0910`, with 2+ slaves) plus an
+alternating follower DC-diff read (`0x092C`) / round-robin AL-status poll.
+Everything on this path is allocation-free and never busy-waits.
 
-A `CyclicStatus { phase, wkc, expected_wkc, cycles }` snapshot backs `status` and
-`pd` (no-arg). The **HAL pin layer** (`src/hal/`) reads/writes named pins over the
-image: `read_value` / `write_value` handle `bit` (mask at `bit_pos`), `u32`
-(zero-extend), and `s32` (sign-extend) per the pin's `hal_type`.
+A `CyclicStatus` snapshot backs `status`, `stats`, `pd` (no-arg), and `monitor`:
+beyond `phase` / `wkc` / `expected_wkc` / `cycles` it carries the configured
+`rate_hz` / `period_us`, the **interrupt-latency** stats, and the decoded DC
+system-time difference (ESC `0x092C`). The latency is the absolute delay from the
+PIT hardware fire to the ISR actually running, read at ISR entry from the PIT
+down-counter (`LDVAL − CVAL`); the snapshot reports its `min` / `max` (ns), the
+**jitter** = `max − min`, and the worst-case latency in core cycles. Unlike a
+tick-to-tick interval — which is always exactly the period, because the PIT and
+core clocks are synchronous and the WFI wake is deterministic, hiding all jitter —
+this latency spread exposes real scheduling jitter under load (see
+[`cli-reference.md`](cli-reference.md#stats--cyclic-telemetry-one-shot)). The
+**HAL pin layer** (`src/hal/`) reads/writes named pins over the image: `read_value`
+/ `write_value` handle `bit` (mask at `bit_pos`), `u32` (zero-extend), and `s32`
+(sign-extend) per the pin's `hal_type`.
+
+### 6.3 Host-bridge integration (`cyclic.rs` + `hal/host_bridge.rs`)
+
+When a Raspberry Pi / LinuxCNC host is attached over the LPSPI3 SPI bridge, the
+PIT task runs `tick_with_host` instead of the bare `tick`: each cycle it applies
+the host's staged outputs to the image, runs the CiA-402 sequencer (`cia402.rs`)
+so the Teensy owns the controlword from the host's *intent*, applies the unified
+**safe-state** (host-watchdog timeout / motion-buffer underrun / `Faulted` →
+CiA-402 quick-stop), sends the LRW, then snapshots the live inputs + status into
+the reply the SPI task returns. Every image write stays inside this prio-3 path, so
+the SPI task (prio 2) only moves bytes through the shared `HostBridge` and never
+locks the master. The wire contract and motion look-ahead are documented in
+[`linuxcnc-spi-bridge.md`](linuxcnc-spi-bridge.md). In the committed two-drive
+config the motion stream is inactive (immediate-only); this path is newer and less
+hardware-tested than the EtherCAT core.
 
 ---
 
@@ -315,28 +366,35 @@ The RTIC application is in [`src/main.rs`](../src/main.rs):
 | `init` | startup | — | Clocks, LEDs, SysTick monotonic (`Mono`, 1 kHz), USB, ENET, build the `Master`; spawn `blink_leds` + `ethercat_worker`. The PIT is configured lazily by `start`. |
 | `ethercat_worker` | async software task | 1 | The command loop: take a parsed command, drive its non-blocking FSM to completion (yielding between datagrams), publish the response, wake USB. Owns the cyclic-engine lifecycle. |
 | `blink_leds` | async software task | 1 | LED heartbeat (alternates pins 4/5) = "tasks running". |
-| `usb_isr` | `binds = USB_OTG1` | 2 | Poll the USB CDC device, parse typed lines into commands, queue them, and flush command responses promptly; also emits the one-time boot banner + scan summary and handles the bootloader/reboot requests. |
-| `cyclic` | `binds = PIT` | 3 | One short, non-blocking cyclic tick: clear the PIT flag, lock the master, `cyclic_tick()`. Highest priority so the cycle is not delayed by USB or the worker. |
+| `usb_isr` | `binds = USB_OTG1` | 2 | Poll the USB CDC device, parse typed lines into commands, queue them, and flush command responses promptly; also emits the one-time boot banner and handles the bootloader/reboot requests. |
+| `host_spi_task` | `binds = LPSPI3` | 2 | Service the Pi/LinuxCNC SPI-slave transport: on a completed frame, hand the inbound bytes to the shared `HostBridge`, stage the reply the cyclic task prepared, re-arm, and strobe `FRAME_READY`. Never locks the EtherCAT master. |
+| `cyclic` | `binds = PIT` | 3 | One short, non-blocking cyclic tick: clear the PIT flag, lock the master + host bridge, run `host_cycle` (`tick_with_host`). Highest priority so the cycle is not delayed by USB or the worker. |
 
 ### The shared `ecat_master` resource
 
 ```rust
 #[shared]
 struct Shared {
-    ecat_scan: EcatScan,          // scan result for the boot report
+    ecat_scan: EcatScan,          // vestigial boot-scan slot (unused since cooperative boot)
     ecat_cmd:  Option<cli::Command>,  // usb_isr -> worker command slot
     ecat_out:  EcatOut,           // worker -> usb_isr response bytes
     ecat_master: EcatMasterCell,  // the Master, locked by worker (1) and cyclic (3)
+    host_bridge: HostBridge,      // SPI staging, shared by host_spi_task (2) + cyclic (3)
 }
 ```
 
 `ecat_master` is locked by both `ethercat_worker` (priority 1) and the `cyclic`
-PIT task (priority 3). Under RTIC's priority-ceiling protocol the lock's ceiling
-is therefore **3**, which **masks `usb_isr` (priority 2)** whenever the master is
-held. This is the key constraint that shapes the boot (§8). The cyclic task is the
-highest-priority user, so *its* lock never blocks. `EcatMasterCell` is a `Send`
-wrapper justified by single-core exclusive ownership (the master holds `&'static
-mut` ENET descriptor tables containing raw pointers).
+PIT task (priority 3); `host_bridge` is locked by the worker (1), `host_spi_task`
+(2), and `cyclic` (3). Under RTIC's priority-ceiling protocol each lock's ceiling
+is therefore **3**, which **masks `usb_isr` / `host_spi_task` (priority 2)**
+whenever it is held. This is the key constraint that shapes the boot (§8). The
+cyclic task is the highest-priority user of both resources, so it is never made to
+*wait* on a lock — but it can still be briefly **masked** (delayed) while a
+lower-priority holder runs its short, bounded, busy-wait-free critical section (a
+worker status snapshot, or the SPI task's `HostBridge` ingest/reply): bounded
+priority inversion, not unbounded blocking. `EcatMasterCell` is a `Send` wrapper
+justified by single-core exclusive ownership (the master holds `&'static mut` ENET
+descriptor tables containing raw pointers).
 
 ---
 
@@ -404,9 +462,8 @@ it over USB.
 ### Two crash classes
 
 - **CPU HardFault** (`HardFault` exception handler): records the stacked exception
-  frame (`pc`, `lr`, `sp`, `msp`, `r0–r3`, `r12`, `xpsr`), the SCB fault-status
-  registers (`cfsr`, `hfsr`, `bfar`, `mmfar`), and `send_stage` (how far the first
-  ENET send had progressed), then **`sys_reset()`**. The handler is minimal-stack
+  frame (`pc`, `lr`, `sp`, `msp`, `r0–r3`, `r12`, `xpsr`) and the SCB fault-status
+  registers (`cfsr`, `hfsr`, `bfar`, `mmfar`), then **`sys_reset()`**. The handler is minimal-stack
   (field stores only, no formatting) because the fault may itself be a stack
   overflow. The board reboots and is recoverable over USB; read the dump with
   `crashlog`.
@@ -427,7 +484,6 @@ Field reference:
 | `cfsr` / `hfsr` | Configurable / Hard fault status registers (the fault cause bits). |
 | `bfar` / `mmfar` | Bus-fault / mem-manage fault address (valid only when the matching CFSR bit is set). |
 | `r0–r3`, `r12`, `xpsr` | The stacked caller context. |
-| `send_stage` | `0`/`1`/`2` — how far `Device::send` got (localizes a fault in the first ENET send). |
 
 ### Boot-stage and fault LED codes
 

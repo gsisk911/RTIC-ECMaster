@@ -14,7 +14,7 @@
 use crate::ethercat::config::model::SlaveCfg;
 use crate::ethercat::datagram::{self, Command};
 use crate::ethercat::device::{Device, Pump};
-use crate::ethercat::dc::FsmDc;
+use crate::ethercat::dc::{DcRef, FsmDc};
 use crate::ethercat::ecrt::EcError;
 use crate::ethercat::fmmu_config;
 use crate::ethercat::fsm_change::FsmChange;
@@ -56,6 +56,7 @@ pub struct FsmSlaveConfig {
     slave: &'static SlaveCfg,
     station: u16,
     mbox: Mailbox,
+    dc_ref: DcRef,
     phase: Phase,
     pump: Pump,
     tx: [u8; 96],
@@ -70,11 +71,12 @@ pub struct FsmSlaveConfig {
 }
 
 impl FsmSlaveConfig {
-    pub fn new(station: u16, mbox: Mailbox, slave: &'static SlaveCfg) -> Self {
+    pub fn new(station: u16, mbox: Mailbox, slave: &'static SlaveCfg, dc_ref: DcRef) -> Self {
         Self {
             slave,
             station,
             mbox,
+            dc_ref,
             phase: Phase::ClearFmmus,
             pump: Pump::new(),
             tx: [0; 96],
@@ -235,7 +237,7 @@ impl FsmSlaveConfig {
                     }
                     Some(cfg) => {
                         if self.dc.is_none() {
-                            self.dc = Some(FsmDc::new(self.station, cfg));
+                            self.dc = Some(FsmDc::new(self.station, cfg, self.dc_ref));
                         }
                         if self.dc.as_mut().unwrap().step(dev, index)? {
                             self.dc = None;

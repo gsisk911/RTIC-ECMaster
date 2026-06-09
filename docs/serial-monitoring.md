@@ -59,10 +59,11 @@ Press Ctrl-C to stop.
 2026-06-04 08:19:01.412 | [boot] teensy-rust-modbus-base 0.1.0 (v0.1.0-g1a2b3c4)
 2026-06-04 08:19:01.460 | [boot] EtherCAT master over RMII ENET; type 'help' for commands
 2026-06-04 08:19:14.002 | [scan] counting slaves
-2026-06-04 08:19:14.051 | [scan] count=1
+2026-06-04 08:19:14.051 | [scan] count=2
 2026-06-04 08:19:14.190 | [scan] s1: vendor=0x00000994
-2026-06-04 08:19:14.260 | [ecat] rescan complete: 1 slave(s); type 'slaves'
-2026-06-04 08:19:31.118 | [ecat] cyclic OP wkc=3/3 cycles=128407
+2026-06-04 08:19:14.232 | [scan] s2: vendor=0x00000994
+2026-06-04 08:19:14.260 | [ecat] rescan complete: 2 slave(s); type 'slaves'
+2026-06-04 08:19:31.118 | [ecat] cyclic OP 100Hz wkc=6/6 cycles=128407 ('stats' for detail)
 ```
 
 ### All flags
@@ -111,7 +112,7 @@ python -m serial.tools.miniterm --echo 115200
 `screen /dev/cu.usbmodemXXXXXX 115200`, `picocom -b 115200 /dev/cu.usbmodemXXXXXX`,
 or any serial monitor (Arduino IDE, etc.). This is the setup for the
 [README quick start](../README.md#quick-start--using-it-as-a-driver): type
-`rescan`, `start -p0`, `pd …` and read the replies inline.
+`rescan`, `start`, `pd …` and read the replies inline.
 
 ### B. Passive capture — `view_teensy_serial.py`
 
@@ -139,13 +140,17 @@ type a command** (in setup A). What to watch for:
   per-slave AL/DL/SII identity), ending with `[ecat] rescan complete: N slave(s)`.
   If the firmware faults mid-scan, every step up to the fault is already on screen
   — this is the main no-SWD diagnostic.
-- `start -p0` runs the full INIT → SAFE-OP bring-up and starts the cyclic engine;
-  it replies `[ecat] slave 0 configured; cyclic PDO started`.
+- `start` runs the full INIT → SAFE-OP bring-up on **every** configured slave and
+  starts the cyclic engine; it replies `[ecat] 2 slave(s) configured; cyclic PDO
+  started at 100 Hz` (or the `-r<hz>` rate). One LRW spans the whole bus, so `-p` is
+  accepted but ignored. Add `-r<hz>` to launch at another rate (50 – 8000 Hz).
 
 **During the cyclic PDO task**
 
-- `status` shows `link=… slaves=…` and, while cycling, `cyclic OP wkc=3/3
-  cycles=…` — watch that the phase reaches `OP` and the working counter is full.
+- `status` shows `link=… slaves=…` and, while cycling, `cyclic OP 100Hz wkc=6/6
+  cycles=…` — watch that the phase reaches `OP` and the working counter is full
+  (`6/6` for the two-drive bus). `stats` / `monitor` add interrupt latency / jitter
+  and DC sync error.
 - `pd` (no args) dumps the live process image + cyclic status; `pd <pin>` reads a
   named input (e.g. `pd drive0-statusword`); `pd <pin> <value>` writes an output
   (e.g. `pd drive0-controlword 15`).

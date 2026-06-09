@@ -5,14 +5,14 @@
 
 #define TEENSY_MAGIC 0xA7ECu
 #define TEENSY_VERSION 1u
-#define TEENSY_MOSI_LEN 27
-#define TEENSY_MISO_LEN 59
-#define TEENSY_FRAME_LEN 59
-#define TEENSY_OUT_BYTES 16
-#define TEENSY_IN_BYTES 39
+#define TEENSY_MOSI_LEN 43
+#define TEENSY_MISO_LEN 98
+#define TEENSY_FRAME_LEN 98
+#define TEENSY_OUT_BYTES 32
+#define TEENSY_IN_BYTES 78
 #define TEENSY_MOSI_HDR 8
 #define TEENSY_MISO_HDR 18
-#define TEENSY_STREAM_OFF 24
+#define TEENSY_STREAM_OFF 40
 #define TEENSY_SAMPLE_BYTES 0
 #define TEENSY_SAMPLE_STRIDE 4
 #define TEENSY_MAX_SAMPLES_PER_FRAME 0
@@ -55,8 +55,25 @@ static const teensy_pin_t TEENSY_PINS[] = {
     { "drive0-touch-probe-pos2-positive", 48, 0, 32, 's', 'i' },
     { "drive0-touch-probe-pos2-negative", 52, 0, 32, 's', 'i' },
     { "drive0-op-mode-display", 56, 0, 8, 's', 'i' },
+    { "drive1-controlword", 24, 0, 16, 'u', 'o' },
+    { "drive1-target-position", 26, 0, 32, 's', 'o' },
+    { "drive1-target-velocity", 30, 0, 32, 's', 'o' },
+    { "drive1-touch-probe-function", 34, 0, 16, 'u', 'o' },
+    { "drive1-digital-outputs", 36, 0, 32, 'u', 'o' },
+    { "drive1-error-code", 57, 0, 16, 'u', 'i' },
+    { "drive1-statusword", 59, 0, 16, 'u', 'i' },
+    { "drive1-actual-position", 61, 0, 32, 's', 'i' },
+    { "drive1-digital-inputs", 65, 0, 32, 'u', 'i' },
+    { "drive1-actual-velocity", 69, 0, 32, 's', 'i' },
+    { "drive1-follow-error", 73, 0, 32, 's', 'i' },
+    { "drive1-touch-probe-status", 77, 0, 16, 'u', 'i' },
+    { "drive1-touch-probe-pos1-positive", 79, 0, 32, 's', 'i' },
+    { "drive1-touch-probe-pos1-negative", 83, 0, 32, 's', 'i' },
+    { "drive1-touch-probe-pos2-positive", 87, 0, 32, 's', 'i' },
+    { "drive1-touch-probe-pos2-negative", 91, 0, 32, 's', 'i' },
+    { "drive1-op-mode-display", 95, 0, 8, 's', 'i' },
 };
-#define TEENSY_PIN_COUNT 17
+#define TEENSY_PIN_COUNT 34
 
 /* Streamed motion fields: which output pin sources each sample slice. */
 typedef struct {

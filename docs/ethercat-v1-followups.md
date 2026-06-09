@@ -124,6 +124,60 @@ Still deferred:
 - Mailbox header address field is written as 0 vs IgH's slave station address
   (CoE-safe; matters for EoE routing).
 
+## Multi-slave bring-up & Distributed Clocks (v1.x)
+
+Source: hardware bring-up of a two-drive bus (both YAKO/Bohign `0x994` / `0x1B00`).
+
+Done in this feature:
+- **Multi-slave cyclic operation.** `start` brings up the **whole configured bus**:
+  `ConfigSeq` runs the per-slave `FsmSlaveConfig` once per slave to SAFE-OP, then the
+  cyclic engine drives **every** slave to OP with per-slave AL gating. One LRW spans
+  all slaves and the working counter scales (`+3` per drive); `stop`'s `DownSeq`
+  walks every slave back down to PRE-OP. Hardware-verified with two drives reaching
+  OP at `wkc = 6/6`, at both 100 Hz and 4 kHz. (The `-p` CLI position is retained for
+  compatibility but no longer selects a subset.)
+- **Static DC delay/offset compensation.** The per-slave bring-up, before SYNC0
+  activation, latches port receive times (`BWR 0x0900`), then per follower writes
+  the propagation delay (`0x0928`) and the system-time offset
+  (`0x0920` = reference − local, from a coincident single-frame read of both
+  system times) so the followers start DC-aligned. Hardware-verified: the
+  follower's `0x092C` reads **sub-µs from the first cyclic sample** — ±~77 ns at
+  100 Hz and ±~126 ns at 4 kHz (vs 33.8 ms → 0.9 ms converging with the ARMW
+  alone). The delay is exact for a line topology; a branched/out-of-range reading
+  falls back to offset-only (still sub-µs).
+- **Continuous DC reference-time distribution.** In OP with two or more slaves the
+  master appends an ARMW of `0x0910` each cycle (auto-increment-addressed at the
+  reference slave) to maintain the followers after the static alignment, and reads
+  real drift from a follower's `0x092C`.
+- **Generator guards for a multi-slave bus.** The config generator is N-slave and
+  now rejects a duplicate `halPin` name (pin names index the image globally, so they
+  must be namespaced per slave, e.g. `drive0-*` / `drive1-*`) and requires each
+  matched ESI device to declare ≥ 4 sync managers (SM0..SM3).
+
+Still deferred:
+- **Per-drive SM sync-type + SYNC0-shift options.** Surface the SM2 (outputs,
+  master→slave / "m2s") and SM3 (inputs, slave→master / "s2m") **sync-mode**
+  parameters (CoE `0x1C32:01` / `0x1C33:01` — free-run / SM-synchronous /
+  DC-SYNC0 / DC-SYNC1) and the **SYNC0 shift** as per-drive config options
+  (XML `dcConf`/`syncManager` attrs → `model.rs` → codegen → DC/SM bring-up).
+  `sync0Shift` is already parsed from the XML but not yet wired into the DC
+  activation; the `0x1C32`/`0x1C33` sync-type SDO writes are not yet emitted.
+  These are normally per-drive options.
+- **First-`start`-after-reflash from a stale drive state.** If the master is
+  reflashed (or reset) while the cyclic LRW is running, the drives lose process
+  data and watchdog-drop with a latched state; the next `start` can fail the
+  SAFE-OP transition (observed `AL status code 0x0000` = timeout). A
+  `states -p<n> INIT` on each drive clears it and `start` then succeeds; the clean
+  `stop` → `start` path is unaffected. Bring-up should detect a stale/error
+  follower and force it through INIT (resetting stale DC) before the static
+  compensation runs.
+- **Per-drive host enable.** The CiA-402 sequencer (`Cia402::step`) applies one
+  enable / fault-reset / quick-stop command **bus-wide** to every discovered drive;
+  per-drive host intent is not yet wired through the SPI bridge.
+- **Jitter under sustained load** is not yet characterized on hardware. The new
+  PIT-CVAL interrupt-latency metric (`latency`/`jitter` in `stats`) exposes it, but
+  the load sweep (e.g. driving the SPI host bridge hard) has not been run.
+
 ## Other deferred (from the plan, not the review)
 
 - Drop the `smoltcp` dependency from the EtherCAT path (only its `phy` tokens +

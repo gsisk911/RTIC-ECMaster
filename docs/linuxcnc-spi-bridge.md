@@ -20,6 +20,28 @@
 **Hosts:** Teensy 4.1 (i.MX RT1062 Cortex-M7 @ 600 MHz) ⟷ Raspberry Pi 5 (PREEMPT_RT, LinuxCNC HAL).
 **Host bus:** SPI (Pi master / Teensy LPSPI slave) on a shared PCB / Pi-HAT, target 40 MHz + GPIO sync line(s).
 
+> **Implementation status (updated).** v1 of this bridge is now **implemented**, not
+> just planned: the LPSPI3 SPI-slave transport
+> ([`src/board/host_spi.rs`](../src/board/host_spi.rs)), the frame codec + shared
+> staging ([`src/hal/host_bridge.rs`](../src/hal/host_bridge.rs)), the motion
+> look-ahead ring ([`src/hal/motion_buffer.rs`](../src/hal/motion_buffer.rs)), the
+> CiA-402 sequencer ([`src/ethercat/cia402.rs`](../src/ethercat/cia402.rs) — no
+> longer a stub), the cyclic-tick hook (`tick_with_host` in
+> [`src/ethercat/cyclic.rs`](../src/ethercat/cyclic.rs)), the unified safe-state
+> (host-watchdog / underrun / EtherCAT-fault → quick-stop), and the generated
+> contract + LinuxCNC HAL component ([`linuxcnc/`](../linuxcnc/)). `make config`
+> emits the exact frame offsets into
+> [`linuxcnc/teensy_bridge_layout.h`](../linuxcnc/teensy_bridge_layout.h).
+> **Now also implemented:** multi-slave cyclic operation (the committed config is
+> **two** drives, hardware-verified to OP at `wkc = 6/6`) and continuous DC
+> reference-time distribution (ARMW `0x0910`) — see
+> [`architecture.md`](./architecture.md#5-distributed-clocks-sync0-dcrs). **Still
+> design-only / inactive in the committed two-drive config:** the `<motionStream>`
+> look-ahead (the ring is built but inert until a stream is configured),
+> multi-PDO-per-SM, PSRAM deep buffering, and Pi phase-lock. The sections below are
+> the original design brief — read present-tense "to implement" notes as historical
+> where the code above already exists.
+
 ---
 
 ## Table of contents
@@ -87,7 +109,7 @@ Chosen split: **Hybrid** — smart-enough Teensy, motion-owning Pi.
 | --- | --- | --- |
 | Trajectory / kinematics / PID / GUI | **Pi (LinuxCNC)** | Mature motion stack; don't reimplement on the MCU. |
 | Per-axis setpoint stream (pos/vel/torque) | **Pi → Teensy buffer** | Streamed ahead; see §7. |
-| CiA-402 drive state machine (enable/fault/quick-stop) | **Teensy** (`src/ethercat/cia402.rs`) | Currently a stub; this design requires implementing it. |
+| CiA-402 drive state machine (enable/fault/quick-stop) | **Teensy** (`src/ethercat/cia402.rs`) | Implemented; sequences each drive from the host's enable / fault-reset / quick-stop intent. |
 | EtherCAT cyclic PDO, DC/SYNC0, WKC health | **Teensy** (`src/ethercat/cyclic.rs`, `dc.rs`) | Already implemented; the bridge feeds/reads its image. |
 | Hard safe-state (stop on fault/stall) | **Teensy** | Deterministic; the only thing with the real clock. |
 | Configuration (drives, PDO map, HAL names) | **Bus XML** | Single source of truth (§4). |
@@ -157,7 +179,7 @@ in HAL.
 
 > **Which XML is canonical?** The generator's `--bus` argument selects the source
 > file; it currently defaults to `ethercat-conf.bohign.xml` (the verified
-> single-drive bench config), while `ethercat-conf.xml` holds the full 8-node
+> two-drive bench config), while `ethercat-conf.xml` holds the full 8-node
 > machine. "Single source of truth" means *whichever* `--bus` file a given build
 > targets — both follow the same schema (§5). The worked numbers here use the
 > 8-node `ethercat-conf.xml`.
@@ -407,9 +429,9 @@ Disable), using the controlword logic that lives in `cia402.rs`:
 | **Drive fault** | CiA-402 statusword fault bit | reflect to `fault_flags`; latch |
 | **Hardware E-stop** (optional) | dedicated GPIO | immediate quick-stop/disable |
 
-The Teensy is also the **CiA-402 sequencer** (currently `src/ethercat/cia402.rs`
-is a stub): it walks Switch-On-Disabled → … → Operation-Enabled on host
-`request-enable`, performs fault-reset on request, and owns quick-stop. The Pi
+The Teensy is also the **CiA-402 sequencer** (implemented in
+`src/ethercat/cia402.rs`): it walks Switch-On-Disabled → … → Operation-Enabled on
+host `request-enable`, performs fault-reset on request, and owns quick-stop. The Pi
 sends *intent* (`flags`) and reads *status*; it never hand-toggles the controlword
 through the buffered path.
 
@@ -476,9 +498,9 @@ Grounded in the current tree (`src/ethercat/`, `src/hal/`, `src/board/`,
 4. **Cyclic hook** `src/ethercat/cyclic.rs` — add the pre-LRW pop+apply hook (§7.2)
    inside `Cyclic::tick`/`send`. This is a real edit to the cyclic engine, not an
    unchanged path.
-5. **Implement `src/ethercat/cia402.rs`** — controlword/statusword state machine,
+5. **`src/ethercat/cia402.rs`** *(done)* — controlword/statusword state machine,
    fault-reset, quick-stop, driven each cyclic tick; consumed by the safe-state
-   handler (§9). (Currently a `// TODO` stub.)
+   handler (§9).
 6. **Safe-state handler** — unify the triggers in §9; integrate with the existing
    `Phase::Faulted` handling in `cyclic.rs`.
 7. **Generator** `scripts/generate_ethercat_config.py` — parse §5 additions
@@ -518,7 +540,7 @@ device is exactly what `hm2_rpspi` + Mesa does — a proven in-tree pattern.
 1. **Transport bring-up.** LPSPI3 slave + a trivial fixed-size loopback frame
    (header + CRC + echo). Validate 40 MHz on the PCB, measure transfer time, prove
    `FRAME_READY` timing. No motion yet.
-2. **Immediate-only bridge.** Map the existing image (the verified single-drive
+2. **Immediate-only bridge.** Map the existing image (the verified two-drive
    `generated.rs`) into immediate-in/out; a minimal Pi HAL component reads/writes
    pins. Equivalent capability to the serial `pd` command, but realtime.
 3. **CiA-402 + safe state.** Implement `cia402.rs`, host watchdog, quick-stop, and

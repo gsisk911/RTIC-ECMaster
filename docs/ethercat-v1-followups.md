@@ -16,6 +16,16 @@ Source: correctness review of the scan port against IgH `stable-1.6`.
 ## Residual risks
 
 ### 1. Blocking scan starves the priority-1 RTIC executor
+> **Update (resolved on the live path):** the runtime scan is now the
+> non-blocking [`src/ethercat/fsm_scan.rs`](../src/ethercat/fsm_scan.rs)
+> (`ScanFsm`), stepped one datagram at a time via `Device::pump` and reached by
+> `rescan` (and the scan implied before `start`). It streams `[scan]` trace lines
+> and yields between datagrams, so it no longer monopolizes the executor. The
+> boot path also no longer auto-scans (see "Cooperative boot" in
+> [`architecture.md`](architecture.md#8-cooperative-boot)). A blocking
+> `Device::transact` / `fsm_master::scan_bus` path still exists but is off the
+> worker/cyclic hot path. The note below describes the original blocking design.
+
 - Where: [src/main.rs](../src/main.rs) `ethercat_worker` task (the boot scan and
   the `rescan` command) + [src/ethercat/device.rs](../src/ethercat/device.rs)
   `transact`.

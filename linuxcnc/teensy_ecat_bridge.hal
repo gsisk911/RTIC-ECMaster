@@ -1,0 +1,52 @@
+# Example HAL wiring for the Teensy EtherCAT bridge (single drive: drive0).
+#
+# Illustrative: adapt pin/joint names and scales to your machine. Process-data
+# pins are raw drive units (s32 counts); LinuxCNC joints are floats, so position
+# command/feedback go through a scale + type conversion.
+#
+# Load order (in your main .hal, after [KINS]/[EMCMOT] motion is loaded):
+#   loadrt teensy_ecat_bridge device=/dev/spidev0.0 spi_hz=40000000 lead=10
+#   addf teensy-ecat.update servo-thread
+#
+# This file assumes that load line has run.
+
+loadrt scale names=pos-cmd-scale,pos-fb-scale
+loadrt conv_float_s32 names=pos-cmd-conv
+loadrt conv_s32_float names=pos-fb-conv
+loadrt or2 names=ecat-fault-or
+
+addf pos-cmd-scale   servo-thread
+addf pos-cmd-conv    servo-thread
+addf pos-fb-conv     servo-thread
+addf pos-fb-scale    servo-thread
+addf ecat-fault-or   servo-thread
+
+# ── Enable / reset intent (Teensy owns the CiA-402 controlword) ──
+net drive0-enable   joint.0.amp-enable-out   teensy-ecat.enable
+net drive0-fault-rst <your-fault-reset-signal> teensy-ecat.fault-reset
+# quick-stop can be tied to a panic input if desired:
+# net estop-quickstop  <your-signal>  teensy-ecat.quick-stop
+
+# ── Position command: joint float (machine units) -> s32 counts -> drive ──
+# Set pos-cmd-scale.gain = counts per machine unit for this axis.
+setp pos-cmd-scale.gain 10000
+net pos-cmd-f   joint.0.motor-pos-cmd   pos-cmd-scale.in
+net pos-cmd-s   pos-cmd-scale.out       pos-cmd-conv.in
+net pos-cmd-cnt pos-cmd-conv.out        teensy-ecat.drive0-target-position
+
+# ── Position feedback: drive s32 counts -> float -> joint ──
+setp pos-fb-scale.gain 0.0001
+net pos-fb-cnt  teensy-ecat.drive0-actual-position  pos-fb-conv.in
+net pos-fb-s    pos-fb-conv.out                      pos-fb-scale.in
+net pos-fb-f    pos-fb-scale.out                     joint.0.motor-pos-fb
+
+# ── Safety: bridge fault / host-timeout / offline -> E-stop chain ──
+# Any of: drive/EtherCAT fault, host watchdog timeout, or SPI offline.
+net ecat-fault     teensy-ecat.fault         ecat-fault-or.in0
+net ecat-htimeout  teensy-ecat.host-timeout  ecat-fault-or.in1
+# Feed the OR (plus check .online) into your estop logic, e.g.:
+# net ecat-fault-out ecat-fault-or.out  <your-estop-input>
+
+# ── Optional digital I/O example (IO node, when present) ──
+# net spindle-on  motion.spindle-on  teensy-ecat.do5-ch1
+# net probe-in    teensy-ecat.di1-ch1  motion.probe-input

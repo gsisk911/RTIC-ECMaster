@@ -18,9 +18,30 @@ TEENSY4_CORE_CLOCK_HZ = "600000000"
 TEENSY4_ALLOW_OVERCLOCK = "true"
 # Must also be "true" for profiles whose requested voltage reaches the DCDC max.
 TEENSY4_ALLOW_MAX_VOLTAGE = "false"
+# Main stack size, in bytes (DTCM, grows down from `_stack_start`). teensy4-bsp's
+# build script wires this env var to imxrt-rt's RuntimeBuilder::stack_size via
+# `.stack_size_env_override("TEENSY4_STACK_SIZE")`; setting it here regenerates
+# t4link.x with a larger `.stack`. Raised from the 16 KiB default to 64 KiB so
+# the deep startup/scan call path (poll_op's ~1.7 KB Op local + per-FSM scratch)
+# cannot overflow the stack. DTCM is 320 KiB, so .vectors/.data/.bss still fit
+# with ~226 KiB to spare. (.uninit/CRASHLOG and the heap live in OCRAM.)
+TEENSY4_STACK_SIZE = "65536"
 LED_INDICATOR_PIN = "13"
 BASE_LED_A_PIN = "4"
 BASE_LED_B_PIN = "5"
 BASE_LED_BLINK_HZ = "2"
+# ── Raspberry Pi / LinuxCNC host SPI bridge (LPSPI3 slave) ──
+# Teensy pin numbers for the LPSPI3 signal pads. These are fixed-function pads,
+# so only the LPSPI3-capable pins are accepted (see board/host_spi.rs):
+#   HOST_SPI_SDO_PIN: 26 (GPIO_AD_B1_14)   - peripheral data out  (MISO to Pi)
+#   HOST_SPI_SCK_PIN: 27 (GPIO_AD_B1_15)   - clock in             (from Pi)
+#   HOST_SPI_SDI_PIN: 39 (GPIO_AD_B1_13)   - peripheral data in   (MOSI from Pi)
+#   HOST_SPI_CS_PIN : 38 (GPIO_AD_B1_12) or 0 (GPIO_AD_B0_03) - chip select in
+# FRAME_READY is a plain GPIO output (24 = GPIO_AD_B0_12, or 25 = GPIO_AD_B0_13).
+HOST_SPI_SDO_PIN = "26"
+HOST_SPI_SCK_PIN = "27"
+HOST_SPI_SDI_PIN = "39"
+HOST_SPI_CS_PIN = "38"
+HOST_SPI_FRAME_READY_PIN = "25"
 
 

@@ -6,7 +6,7 @@
 //! `ecdev_*` hooks; here it is the Teensy 4.1 RMII ENET driver in `crate::net`.
 //! Rust: builds the 14-byte Ethernet header (broadcast dst, fixed src,
 //! EtherType 0x88A4 big-endian) and matches replies by datagram index; the
-//! borrow-checked `send_raw`/`poll_raw` helpers replace `sk_buff` handling.
+//! borrow-checked `send_frame`/`poll_raw` helpers replace `sk_buff` handling.
 //! Dropped (kernel-only): `net_device`/`sk_buff`/NAPI -> ENET DMA buffers;
 //! interrupt-driven RX -> polled `poll_raw`; `ecdev_*` registration -> direct
 //! ownership of the `EnetDevice`.
@@ -83,18 +83,20 @@ impl<'a> Device<'a> {
 
     /// Send one EtherCAT frame (frame header + datagram(s) + WKC) wrapped in an
     /// Ethernet header. The frame is padded to the 60-byte Ethernet minimum.
+    ///
+    /// Only the 14-byte Ethernet header is built on the stack; the payload is
+    /// copied straight into the TX DMA buffer by `EnetDevice::send_frame`, so no
+    /// MTU-sized frame buffer is placed on this (scan-path) stack frame.
     pub fn send(&mut self, ecat_frame: &[u8]) -> Result<(), EcError> {
-        let mut tx = [0u8; ECAT_MTU];
         let n = ETH_HEADER_LEN + ecat_frame.len();
         if n > ECAT_MTU {
             return Err(EcError::Transport);
         }
-        tx[0..6].copy_from_slice(&[0xFF; 6]); // destination: broadcast
-        tx[6..12].copy_from_slice(&self.src_mac); // source
-        tx[12..14].copy_from_slice(&ETHERCAT_ETHERTYPE.to_be_bytes()); // 0x88A4 (big-endian)
-        tx[ETH_HEADER_LEN..n].copy_from_slice(ecat_frame);
-        let n = n.max(60);
-        if self.enet.send_raw(&tx[..n]) {
+        let mut header = [0u8; ETH_HEADER_LEN];
+        header[0..6].copy_from_slice(&[0xFF; 6]); // destination: broadcast
+        header[6..12].copy_from_slice(&self.src_mac); // source
+        header[12..14].copy_from_slice(&ETHERCAT_ETHERTYPE.to_be_bytes()); // 0x88A4 (big-endian)
+        if self.enet.send_frame(&header, ecat_frame) {
             Ok(())
         } else {
             Err(EcError::Transport)

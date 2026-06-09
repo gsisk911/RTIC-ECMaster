@@ -44,10 +44,6 @@ log = "0.4"
 imxrt-usbd = "0.2"
 usb-device = "0.2.9"
 usbd-serial = "0.1.1"
-
-# Panic handler
-panic-halt = "1"
-
 # W5500 SPI foundation and small fixed-capacity buffers
 embedded-hal = "1.0"
 embedded-hal-02 = { package = "embedded-hal", version = "0.2.7" }

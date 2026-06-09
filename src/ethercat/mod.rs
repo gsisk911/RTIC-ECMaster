@@ -48,6 +48,7 @@ pub mod sync_config;
 pub mod fsm_change;
 pub mod fsm_coe;
 pub mod fsm_master;
+pub mod fsm_scan;
 pub mod fsm_pdo;
 pub mod fsm_pdo_entry;
 pub mod fsm_sii;

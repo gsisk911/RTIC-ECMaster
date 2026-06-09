@@ -17,7 +17,7 @@ const fn e(index: u16, subindex: u8, bit_length: u8) -> EcPdoEntryInfo {
 
 // --- Slave 0: product 0x00001B00 ---
 
-const S0_RX_ENTRIES: &[EcPdoEntryInfo] = &[
+const S0_RX_P0_ENTRIES: &[EcPdoEntryInfo] = &[
     e(0x6040, 0x00, 16),
     e(0x607A, 0x00, 32),
     e(0x60FF, 0x00, 32),
@@ -25,7 +25,11 @@ const S0_RX_ENTRIES: &[EcPdoEntryInfo] = &[
     e(0x60FE, 0x01, 32),
 ];
 
-const S0_TX_ENTRIES: &[EcPdoEntryInfo] = &[
+const S0_RX_PDOS: &[PdoCfg] = &[
+    PdoCfg { index: 0x1600, entries: S0_RX_P0_ENTRIES },
+];
+
+const S0_TX_P0_ENTRIES: &[EcPdoEntryInfo] = &[
     e(0x603F, 0x00, 16),
     e(0x6041, 0x00, 16),
     e(0x6064, 0x00, 32),
@@ -40,15 +44,9 @@ const S0_TX_ENTRIES: &[EcPdoEntryInfo] = &[
     e(0x6061, 0x00, 8),
 ];
 
-const S0_RX_PDOS: &[PdoCfg] = &[PdoCfg {
-    index: 0x1600,
-    entries: S0_RX_ENTRIES,
-}];
-
-const S0_TX_PDOS: &[PdoCfg] = &[PdoCfg {
-    index: 0x1A00,
-    entries: S0_TX_ENTRIES,
-}];
+const S0_TX_PDOS: &[PdoCfg] = &[
+    PdoCfg { index: 0x1A00, entries: S0_TX_P0_ENTRIES },
+];
 
 const S0_SMS: &[SmCfg] = &[
     SmCfg { index: 2, phys_start: 0x1200, control: 0x64, dir: EcDirection::Output, size: 16, pdos: S0_RX_PDOS },

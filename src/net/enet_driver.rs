@@ -238,19 +238,30 @@ impl<'a, const INST: u8, const MTU: usize, const RX_LEN: usize, const TX_LEN: us
         }
     }
 
-    /// Send one complete Ethernet frame (header + payload) on the next free TX
-    /// descriptor. Returns `false` if that descriptor is still owned by the DMA
-    /// engine (ring momentarily full).
+    /// Assemble one Ethernet frame from its `header` (e.g. the 14-byte L2 header)
+    /// and `payload` directly into the next free TX DMA buffer, zero-pad it to
+    /// the 60-byte Ethernet minimum, and start its transmission. Returns `false`
+    /// if that descriptor is still owned by the DMA engine (ring momentarily
+    /// full).
     ///
     /// Raw Layer-2 path for the EtherCAT master; bypasses the smoltcp tokens.
-    pub fn send_raw(&mut self, frame: &[u8]) -> bool {
+    /// Building the frame in place (instead of copying a pre-assembled buffer)
+    /// keeps a full MTU-sized frame off the caller's already-deep scan-path stack.
+    pub fn send_frame(&mut self, header: &[u8], payload: &[u8]) -> bool {
         let pos = self.tx_pos;
         if (self.txdt.desc[pos].flags & 0x8000) != 0 {
             // R (ready) still set: descriptor owned by DMA, prior frame in flight.
             return false;
         }
-        let len = frame.len().min(MTU);
-        self.txdt.bufs[pos][..len].copy_from_slice(&frame[..len]);
+        let hlen = header.len().min(MTU);
+        let plen = payload.len().min(MTU - hlen);
+        self.txdt.bufs[pos][..hlen].copy_from_slice(&header[..hlen]);
+        self.txdt.bufs[pos][hlen..hlen + plen].copy_from_slice(&payload[..plen]);
+        // Zero-pad to the 60-byte Ethernet minimum. The DMA buffer is reused
+        // across sends, so stale bytes in the pad region must be cleared.
+        let total = hlen + plen;
+        let len = total.max(60).min(MTU);
+        self.txdt.bufs[pos][total..len].fill(0);
         let desc = &mut self.txdt.desc[pos];
         desc.len = len as u16;
         // R (ready) | L (last) | TC (append CRC); preserves the W (wrap) bit.

@@ -221,8 +221,12 @@ pub mod al_state {
     pub const BOOT: u8 = 0x03;
     pub const SAFEOP: u8 = 0x04;
     pub const OP: u8 = 0x08;
-    /// Error flag OR'd into the AL status when a transition fails.
+    /// Error flag OR'd into the AL status (0x0130) when a transition fails.
     pub const ERROR: u8 = 0x10;
+    /// AL control (0x0120) acknowledge bit (bit 4, same position as `ERROR`):
+    /// written together with the requested state to clear a latched AL error.
+    /// Mirrors IgH `ec_fsm_change`'s error-acknowledge handshake.
+    pub const ACK_ERROR: u8 = 0x10;
     /// Mask isolating the state nibble from the AL status byte.
     pub const MASK: u8 = 0x0F;
 }

@@ -23,6 +23,20 @@ pub struct SdoType {
     pub size: u8,
 }
 
+/// `monitor` auto-emit control: explicit on/off, or toggle for the bare command.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MonitorMode {
+    On,
+    Off,
+    Toggle,
+}
+
+/// Lowest cyclic rate accepted by `start -r<hz>` (Hz).
+pub const RATE_MIN_HZ: u32 = 50;
+/// Highest cyclic rate accepted by `start -r<hz>` (Hz). The PIT is sized for up
+/// to 4 kHz in normal use; this leaves headroom for experimentation.
+pub const RATE_MAX_HZ: u32 = 8_000;
+
 const TYPES: &[SdoType] = &[
     SdoType { name: "bool", code: 0x0001, size: 1 },
     SdoType { name: "int8", code: 0x0002, size: 1 },
@@ -42,10 +56,15 @@ pub const HELP: &[&str] = &[
     "  states -p<pos> <INIT|PREOP|SAFEOP|OP>    request an AL state",
     "  upload -p<pos> -t<type> <idx> <sub>      SDO read (0x.. hex, else decimal)",
     "  download -p<pos> -t<type> <idx> <sub> <value>   SDO write",
-    "  start [-p<pos>]                          configure + start cyclic PDO (to OP)",
+    "  start [-p<pos>] [-r<hz>]                 configure + start cyclic PDO (50..8000 Hz)",
     "  stop                                     stop cyclic PDO",
+    "  stats                                    cyclic rate, jitter, DC sync error",
+    "  monitor [on|off]                         stream stats ~every 500ms (bare = toggle)",
     "  pdos                                     list process-data pins and offsets",
     "  pd [<pin> [<value>]]                     dump image / read pin / write pin",
+    "  host                                     Pi/LinuxCNC SPI bridge diagnostics",
+    "  crashlog                                 show the saved fault/panic context",
+    "  crashclear                               clear the saved fault/panic context",
     "  types: bool int8 int16 int32 uint8 uint16 uint32",
 ];
 
@@ -75,12 +94,18 @@ pub enum Command {
         data: [u8; 4],
         len: u8,
     },
-    /// Configure a slave and start the cyclic process-data engine.
+    /// Configure a slave and start the cyclic process-data engine at an optional
+    /// rate (`-r<hz>`); `rate_hz` is `None` to use the compile-time rate.
     Start {
         slave: u16,
+        rate_hz: Option<u32>,
     },
     /// Stop the cyclic engine.
     Stop,
+    /// Report cyclic-engine telemetry (rate, jitter, DC sync error).
+    Stats,
+    /// Enable/disable periodic auto-emit of compact telemetry over serial.
+    Monitor(MonitorMode),
     /// List the resolved process-data pins (name -> offset).
     Pdos,
     /// Read/write the process image: no pin = dump; pin = read; pin+value = write.
@@ -88,6 +113,13 @@ pub enum Command {
         pin: Option<heapless::String<48>>,
         value: Option<i64>,
     },
+    /// Pi/LinuxCNC host-SPI bridge diagnostics (link, watchdog, CRC/seq errors,
+    /// motion buffer depth, frame sizes).
+    Host,
+    /// Show the saved fault/panic context persisted across the last reboot.
+    Crashlog,
+    /// Clear the saved fault/panic context.
+    Crashclear,
     Error(heapless::String<96>),
 }
 
@@ -124,18 +156,40 @@ pub fn parse(line: &str) -> Command {
         "download" | "down" => parse_sdo(&toks[1..], true),
         "start" => parse_start(&toks[1..]),
         "stop" => Command::Stop,
+        "stats" => Command::Stats,
+        "monitor" | "mon" => parse_monitor(&toks[1..]),
         "pdos" => Command::Pdos,
         "pd" => parse_pd(&toks[1..]),
+        "host" => Command::Host,
+        "crashlog" => Command::Crashlog,
+        "crashclear" => Command::Crashclear,
         _ => err("unknown command; type 'help'"),
     }
 }
 
 fn parse_start(toks: &[&str]) -> Command {
-    match parse_opts(toks) {
-        Ok(o) => Command::Start {
+    let o = match parse_opts(toks) {
+        Ok(o) => o,
+        Err(e) => return e,
+    };
+    match o.rate {
+        Some(hz) if !(RATE_MIN_HZ..=RATE_MAX_HZ).contains(&hz) => {
+            err("rate out of range (50..8000 Hz)")
+        }
+        rate_hz => Command::Start {
             slave: o.position.unwrap_or(0),
+            rate_hz,
         },
-        Err(e) => e,
+    }
+}
+
+/// Parse `monitor [on|off]`: bare command toggles, `on`/`off` are explicit.
+fn parse_monitor(toks: &[&str]) -> Command {
+    match toks.first().copied() {
+        None => Command::Monitor(MonitorMode::Toggle),
+        Some(t) if t.eq_ignore_ascii_case("on") => Command::Monitor(MonitorMode::On),
+        Some(t) if t.eq_ignore_ascii_case("off") => Command::Monitor(MonitorMode::Off),
+        _ => err("usage: monitor [on|off]"),
     }
 }
 
@@ -166,10 +220,12 @@ fn parse_pd(toks: &[&str]) -> Command {
     }
 }
 
-/// Parsed options: position, type name, and the positional arguments.
+/// Parsed options: position, type name, cyclic rate, and the positional
+/// arguments. `rate` is only consumed by `start`; other commands ignore it.
 struct Opts<'a> {
     position: Option<u16>,
     ty: Option<&'a str>,
+    rate: Option<u32>,
     args: heapless::Vec<&'a str, 8>,
 }
 
@@ -177,6 +233,7 @@ fn parse_opts<'a>(toks: &[&'a str]) -> Result<Opts<'a>, Command> {
     let mut o = Opts {
         position: None,
         ty: None,
+        rate: None,
         args: heapless::Vec::new(),
     };
     let mut i = 0;
@@ -188,6 +245,12 @@ fn parse_opts<'a>(toks: &[&'a str]) -> Result<Opts<'a>, Command> {
             o.position = Some(parse_uint(v).ok_or_else(|| err("invalid position"))? as u16);
         } else if let Some(rest) = t.strip_prefix("-p") {
             o.position = Some(parse_uint(rest).ok_or_else(|| err("invalid position"))? as u16);
+        } else if t == "-r" || t == "--rate" {
+            i += 1;
+            let v = toks.get(i).ok_or_else(|| err("missing value for -r"))?;
+            o.rate = Some(parse_uint(v).ok_or_else(|| err("invalid rate"))? as u32);
+        } else if let Some(rest) = t.strip_prefix("-r") {
+            o.rate = Some(parse_uint(rest).ok_or_else(|| err("invalid rate"))? as u32);
         } else if t == "-t" || t == "--type" {
             i += 1;
             o.ty = Some(toks.get(i).copied().ok_or_else(|| err("missing value for -t"))?);

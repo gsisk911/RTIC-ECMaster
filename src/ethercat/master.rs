@@ -20,6 +20,7 @@ use crate::ethercat::ecrt::EcError;
 use crate::ethercat::fsm_change::FsmChange;
 use crate::ethercat::fsm_coe::FsmCoe;
 use crate::ethercat::fsm_master;
+use crate::ethercat::fsm_scan::{ScanFsm, ScanStep, TraceLine};
 use crate::ethercat::fsm_slave_config::FsmSlaveConfig;
 use crate::ethercat::globals::{al_state, reg, EC_MAX_SLAVES};
 use crate::ethercat::slave::{Mailbox, SlaveInfo};
@@ -46,8 +47,10 @@ pub enum Request {
         data: [u8; 4],
         len: u8,
     },
-    /// Configure a slave to SAFE-OP and start the cyclic process-data engine.
-    StartCyclic { slave: u16 },
+    /// Configure a slave to SAFE-OP and start the cyclic process-data engine,
+    /// running at a `cycle_ns` period (drives both the PIT and the jitter
+    /// baseline).
+    StartCyclic { slave: u16, cycle_ns: u64 },
     /// Stop the cyclic engine.
     StopCyclic,
 }
@@ -78,6 +81,8 @@ pub struct Master<'a> {
     sdo_buf: [u8; 4],
     sdo_len: usize,
     cyclic: Option<Cyclic>,
+    /// Latest scan progress line, consumed by the worker for serial streaming.
+    scan_trace: Option<TraceLine>,
 }
 
 impl<'a> Master<'a> {
@@ -91,7 +96,14 @@ impl<'a> Master<'a> {
             sdo_buf: [0; 4],
             sdo_len: 0,
             cyclic: None,
+            scan_trace: None,
         }
+    }
+
+    /// Take the latest bus-scan progress line (set by the non-blocking scan FSM
+    /// as each sub-step completes) so the worker can stream it over serial.
+    pub fn take_scan_trace(&mut self) -> Option<TraceLine> {
+        self.scan_trace.take()
     }
 
     /// True when the PHY reports link up (safe to start the scan).
@@ -123,7 +135,13 @@ impl<'a> Master<'a> {
     /// Begin a runtime request. Validates the slave/CoE support up front.
     pub fn begin(&mut self, request: Request) -> Result<(), EcError> {
         let op = match request {
-            Request::Rescan => Op::Rescan,
+            Request::Rescan => {
+                // The scan FSM no longer holds a slave list; it streams each
+                // finished slave into `self.slaves`. Clear the previous scan's
+                // results so the new scan starts from an empty topology.
+                self.slaves.clear();
+                Op::Rescan { fsm: ScanFsm::new() }
+            }
             Request::SetState { slave, target } => {
                 let s = self.slave_copy(slave)?;
                 let configure = needs_mailbox(target);
@@ -170,15 +188,31 @@ impl<'a> Master<'a> {
                     },
                 }
             }
-            Request::StartCyclic { slave } => {
+            Request::StartCyclic { slave, cycle_ns } => {
                 let s = self.slave_copy(slave)?;
                 let cfg = slave_cfg(slave).ok_or(EcError::NoSuchSlave)?;
                 Op::StartCyclic {
                     fsm: FsmSlaveConfig::new(s.station_addr, s.mailbox(), cfg),
                     station: s.station_addr,
+                    cycle_ns,
                 }
             }
-            Request::StopCyclic => Op::StopCyclic,
+            Request::StopCyclic => {
+                // Defense in depth: bring the drive down to PRE-OP before the
+                // cyclic LRW stops, so its SM2 (output) watchdog never times out
+                // and latches an AL error. The down-transition is best-effort
+                // (see `drive`); if the engine isn't running there's nothing to
+                // bring down. The PIT is already stopped by the `stop` CLI path,
+                // so the device is free for the state-change datagrams here.
+                let (down, station) = match self.cyclic.as_ref() {
+                    Some(c) => (
+                        Some(FsmChange::new(c.station(), al_state::PREOP)),
+                        c.station(),
+                    ),
+                    None => (None, 0),
+                };
+                Op::StopCyclic { down, station }
+            }
         };
         self.op = Some(op);
         Ok(())
@@ -200,9 +234,18 @@ impl<'a> Master<'a> {
 
     fn drive(&mut self, op: &mut Op) -> Result<Option<Outcome>, EcError> {
         match op {
-            Op::Rescan => {
-                let n = self.scan()?;
-                Ok(Some(Outcome::Rescanned(n)))
+            Op::Rescan { fsm } => {
+                let step = fsm.step(&mut self.device, &mut self.index)?;
+                self.scan_trace = fsm.take_trace();
+                // Drain the slave this step finished (at most one) straight into
+                // our list, so the FSM never accumulates a per-slave Vec.
+                if let Some(slave) = fsm.take_completed_slave() {
+                    let _ = self.slaves.push(slave);
+                }
+                match step {
+                    ScanStep::Pending => Ok(None),
+                    ScanStep::Done => Ok(Some(Outcome::Rescanned(self.slaves.len()))),
+                }
             }
             Op::State { pre } => {
                 if pre.step(&mut self.device, &mut self.index)? {
@@ -246,15 +289,27 @@ impl<'a> Master<'a> {
                     SdoOp::Download { .. } => Ok(Some(Outcome::SdoDownloaded)),
                 }
             }
-            Op::StartCyclic { fsm, station } => {
+            Op::StartCyclic { fsm, station, cycle_ns } => {
                 if fsm.step(&mut self.device, &mut self.index)? {
-                    self.cyclic = Some(Cyclic::new(*station));
+                    self.cyclic = Some(Cyclic::new(*station, *cycle_ns));
                     Ok(Some(Outcome::CyclicStarted))
                 } else {
                     Ok(None)
                 }
             }
-            Op::StopCyclic => {
+            Op::StopCyclic { down, station } => {
+                // Step the down-transition to PRE-OP while it is pending. It is
+                // best-effort: any error (link down, slave gone) is ignored so
+                // `stop` always tears the engine down and the operator regains
+                // control. The error-ack on the next `start` is the backstop if
+                // this doesn't complete.
+                if let Some(fsm) = down.as_mut() {
+                    match fsm.step(&mut self.device, &mut self.index) {
+                        Ok(false) => return Ok(None),
+                        Ok(true) => self.update_state(*station, al_state::PREOP),
+                        Err(_) => {}
+                    }
+                }
                 self.cyclic = None;
                 Ok(Some(Outcome::CyclicStopped))
             }
@@ -271,6 +326,16 @@ impl<'a> Master<'a> {
     pub fn cyclic_tick(&mut self) {
         if let Some(cyclic) = self.cyclic.as_mut() {
             cyclic.tick(&mut self.device, &mut self.index);
+        }
+    }
+
+    /// Advance the cyclic engine for one cycle, integrated with the Pi/LinuxCNC
+    /// host bridge (apply staged outputs + drive control, then snapshot the
+    /// reply). Called from the PIT task while holding both the master and the
+    /// shared `HostBridge`.
+    pub fn host_cycle(&mut self, host: &mut crate::hal::host_bridge::HostBridge) {
+        if let Some(cyclic) = self.cyclic.as_mut() {
+            cyclic.tick_with_host(&mut self.device, &mut self.index, host);
         }
     }
 
@@ -351,8 +416,15 @@ impl SdoOp {
 }
 
 /// An in-flight runtime operation.
+///
+/// Variants embed their FSMs inline (the scan/config FSMs carry per-datagram
+/// scratch buffers). The master lives in a single static cell, so the enum size
+/// is a one-time static cost; boxing would need an allocator we do not have.
+#[allow(clippy::large_enum_variant)]
 enum Op {
-    Rescan,
+    Rescan {
+        fsm: ScanFsm,
+    },
     State {
         pre: PreOp,
     },
@@ -365,8 +437,16 @@ enum Op {
     StartCyclic {
         fsm: FsmSlaveConfig,
         station: u16,
+        cycle_ns: u64,
     },
-    StopCyclic,
+    StopCyclic {
+        /// Best-effort down-transition to PRE-OP, stepped before the engine is
+        /// dropped so the drive's SM watchdog never latches an AL error. `None`
+        /// when no engine was running.
+        down: Option<FsmChange>,
+        /// Station of the slave being brought down (to update tracked state).
+        station: u16,
+    },
 }
 
 /// Find the compile-time desired configuration for a slave ring position.

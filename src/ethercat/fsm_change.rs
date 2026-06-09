@@ -7,6 +7,14 @@
 //! `Device::pump` (no busy-wait), so it can be driven by the async worker now
 //! and the cyclic PDO task later. `Result<_, EcError>` instead of int codes.
 //! Dropped (kernel-only): `jiffies` timeouts -> bounded step/wait counters.
+//!
+//! Entering from a latched AL error (e.g. a Sync-Manager watchdog that fired
+//! when the cyclic LRW stopped) is tolerated: when AL status shows the error
+//! bit, the FSM writes AL control once with the acknowledge bit (0x0120 bit 4)
+//! set alongside the requested state, then re-polls -- mirroring IgH's
+//! `ec_fsm_change`. This lets `start` reconfigure straight from an error state
+//! without a manual `states INIT`. If the error persists after the ack, it is a
+//! genuine transition failure and the AL status code is read and returned.
 
 use crate::ethercat::datagram::{self, Command};
 use crate::ethercat::device::{Device, Pump};
@@ -22,6 +30,7 @@ const MAX_STATE_WAITS: u32 = 1_000;
 enum State {
     WriteControl,
     ReadStatus,
+    AckError,
     ReadStatusCode,
     Done,
 }
@@ -36,6 +45,9 @@ pub struct FsmChange {
     tx_len: usize,
     rx: [u8; 128],
     waits: u32,
+    /// True once a latched AL error has been acknowledged, so a second error
+    /// observation is treated as a real transition failure (read the code).
+    acked: bool,
 }
 
 impl FsmChange {
@@ -50,6 +62,7 @@ impl FsmChange {
             tx_len: 0,
             rx: [0; 128],
             waits: 0,
+            acked: false,
         }
     }
 
@@ -106,8 +119,16 @@ impl FsmChange {
                         }
                         let status = reply.data.first().copied().unwrap_or(0);
                         if status & al_state::ERROR != 0 {
-                            self.state = State::ReadStatusCode;
+                            // Latched AL error. Acknowledge it once (re-request
+                            // the target with the ack bit set); if it is still
+                            // set afterward, it is a genuine failure -> read the
+                            // AL status code and report it.
                             self.tx_len = 0;
+                            self.state = if self.acked {
+                                State::ReadStatusCode
+                            } else {
+                                State::AckError
+                            };
                             return Ok(false);
                         }
                         if status & al_state::MASK == self.target {
@@ -120,6 +141,38 @@ impl FsmChange {
                         if self.waits >= MAX_STATE_WAITS {
                             return Err(EcError::StateChange(0));
                         }
+                        Ok(false)
+                    }
+                }
+            }
+            State::AckError => {
+                if self.tx_len == 0 {
+                    let i = alloc_index(index);
+                    // AL control = requested state | acknowledge bit (0x0120
+                    // bit 4): clears the latched error and re-requests the
+                    // target in one write (mirrors IgH `ec_fsm_change`).
+                    self.tx_len = datagram::build(
+                        &mut self.tx,
+                        i,
+                        Command::Fpwr,
+                        self.station,
+                        reg::AL_CONTROL,
+                        &[self.target | al_state::ACK_ERROR, 0],
+                    );
+                    self.pump.reset();
+                }
+                match dev.pump(&mut self.pump, &self.tx[..self.tx_len], &mut self.rx, PUMP_MAX_ATTEMPTS)? {
+                    None => Ok(false),
+                    Some(len) => {
+                        let reply = datagram::parse(&self.rx[..len]).ok_or(EcError::FrameTooShort)?;
+                        if reply.working_counter != 1 {
+                            return Err(EcError::WorkingCounter);
+                        }
+                        // Acknowledged; poll status again for the target state.
+                        self.acked = true;
+                        self.state = State::ReadStatus;
+                        self.tx_len = 0;
+                        self.waits = 0;
                         Ok(false)
                     }
                 }

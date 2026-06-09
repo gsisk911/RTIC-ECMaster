@@ -18,6 +18,13 @@ pub fn load_value(cycle_ns: u64) -> u32 {
     (ticks.max(1) - 1) as u32
 }
 
+/// The actual cyclic rate (Hz) produced by a given PIT `load` value. Integer
+/// PIT division means the realized rate can differ slightly from the requested
+/// one; this reports what the hardware will actually run at.
+pub fn actual_hz(load: u32) -> u32 {
+    PERCLK_HZ / (load + 1)
+}
+
 /// Configure PIT channel 0 for a `cycle_ns` period: select the 24 MHz
 /// oscillator as PERCLK, gate on the PIT, enable the module, program the load
 /// value, and enable (but do not start) the channel interrupt. Returns the load

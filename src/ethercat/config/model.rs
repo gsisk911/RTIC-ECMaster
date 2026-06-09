@@ -79,6 +79,17 @@ pub struct SdoInit {
     pub data: &'static [u8],
 }
 
+/// One streamed motion field: a slice of a host motion sample copied verbatim
+/// into the process image. `sample_off` is the field's byte offset within the
+/// streamed sample payload; `image_off` is its byte offset in the cyclic image.
+/// Produced by the generator from `<motionStream>` (see `hal::spi_layout`).
+#[derive(Clone, Copy, Debug)]
+pub struct StreamField {
+    pub sample_off: u16,
+    pub image_off: u32,
+    pub len: u8,
+}
+
 /// One named process-data pin resolved to a location in the domain image.
 #[derive(Clone, Copy, Debug)]
 pub struct PinCfg {

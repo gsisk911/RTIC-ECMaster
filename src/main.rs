@@ -9,11 +9,13 @@ mod hal;
 mod net;
 
 use core::sync::atomic::{AtomicBool, Ordering};
+use core::ptr::{addr_of, addr_of_mut};
 use core::{cell::UnsafeCell, fmt::Write as _, mem::MaybeUninit};
 use board::fast_gpio::FastGpioOutput;
 use board::teensy_pin_map::{teensy_pin_to_fast_gpio, FastGpio, TeensyBoard};
+use core::panic::PanicInfo;
+use cortex_m_rt::{exception, ExceptionFrame};
 use imxrt_ral as ral;
-use panic_halt as _;
 use ral::iomuxc;
 use rtic_monotonics::systick::prelude::*;
 use teensy4_bsp as bsp;
@@ -29,13 +31,15 @@ use usbd_serial::CdcAcmClass;
 use net::enet_driver::EnetDevice;
 use net::enet_ring::{RxDT, TxDT};
 use ethercat::cli;
-use ethercat::cyclic::Phase as CyclicPhase;
+use ethercat::cyclic::{CyclicStatus, Phase as CyclicPhase};
 use ethercat::device::{Device, ECAT_MTU, ECAT_RX_LEN, ECAT_TX_LEN};
 use ethercat::ecrt::EcError;
 use ethercat::globals::EC_MAX_SLAVES;
 use ethercat::master::{Master, Outcome, Request};
 use ethercat::slave::SlaveInfo;
 use hal::process_data as pdi;
+use board::host_spi::{self, HostSpi, ServiceEvent};
+use hal::host_bridge::{HostBridge, FRAME_LEN};
 use rtic::Mutex;
 
 systick_monotonic!(Mono, 1_000);
@@ -55,6 +59,12 @@ const LED_INDICATOR_TEENSY_PIN: u8 = parse_u8(env!("LED_INDICATOR_PIN"));
 const LED_A_TEENSY_PIN: u8 = parse_u8(env!("BASE_LED_A_PIN"));
 const LED_B_TEENSY_PIN: u8 = parse_u8(env!("BASE_LED_B_PIN"));
 const BLINK_HZ: u32 = parse_u32(env!("BASE_LED_BLINK_HZ"));
+// Raspberry Pi / LinuxCNC host-SPI bridge pins (LPSPI3 slave); see host_spi.rs.
+const HOST_SPI_SDO_TEENSY_PIN: u8 = parse_u8(env!("HOST_SPI_SDO_PIN"));
+const HOST_SPI_SCK_TEENSY_PIN: u8 = parse_u8(env!("HOST_SPI_SCK_PIN"));
+const HOST_SPI_SDI_TEENSY_PIN: u8 = parse_u8(env!("HOST_SPI_SDI_PIN"));
+const HOST_SPI_CS_TEENSY_PIN: u8 = parse_u8(env!("HOST_SPI_CS_PIN"));
+const HOST_SPI_FRAME_READY_TEENSY_PIN: u8 = parse_u8(env!("HOST_SPI_FRAME_READY_PIN"));
 const LED_SWAP_PERIOD_MS: u32 = 1_000 / (BLINK_HZ * 2);
 /// Lines in the one-time boot banner emitted once per USB attach.
 const BOOT_BANNER_LINES: u8 = 2;
@@ -81,6 +91,14 @@ pub struct EcatMasterCell(EcatMaster);
 // the `ethercat_worker` task; the raw pointers inside reference static DMA
 // descriptor tables and are never accessed from another context.
 unsafe impl Send for EcatMasterCell {}
+
+/// `Send` wrapper for the LPSPI3 slave transport (the RAL instance holds raw
+/// register pointers). Owned exclusively by the prio-2 `host_spi_task`.
+pub struct HostSpiCell(HostSpi);
+
+// SAFETY: single-core MCU. The cell is a `local` resource owned by exactly one
+// task; the LPSPI register pointers are never touched from another context.
+unsafe impl Send for HostSpiCell {}
 
 /// Maximum lines in one command response (enough for `pdos`/`pd` dumps).
 const ECAT_RESP_LINES: usize = 40;
@@ -133,6 +151,15 @@ impl EcatOut {
             let _ = self.buf.extend_from_slice(line.as_bytes());
             let _ = self.buf.extend_from_slice(b"\r\n");
         }
+    }
+
+    /// Load a single CRLF-terminated line as the pending output, replacing any
+    /// prior content. Used to stream one scan-progress line at a time.
+    fn load_line(&mut self, line: &str) {
+        self.buf.clear();
+        self.cursor = 0;
+        let _ = self.buf.extend_from_slice(line.as_bytes());
+        let _ = self.buf.extend_from_slice(b"\r\n");
     }
 
     /// Bytes not yet handed to the host.
@@ -233,6 +260,78 @@ fn drive_bootloader_safe_outputs() {
     led_b.clear();
 }
 
+/// A scalar snapshot of the host-bridge state, copied out under the lock so the
+/// (slower) string formatting runs *outside* the ceiling-3 critical section and
+/// does not add jitter to the cyclic tick.
+#[derive(Clone, Copy)]
+struct HostSnapshot {
+    has_host: bool,
+    frames_in: u32,
+    crc_errs: u32,
+    seq_errs: u32,
+    host_wdog: u16,
+    stall: u16,
+    teensy_wdog: u16,
+    motion_active: bool,
+    motion_depth: usize,
+    motion_underrun: bool,
+}
+
+/// Snapshot the host bridge under the lock (cheap, no formatting).
+fn host_snapshot(hb: &mut HostBridge) -> HostSnapshot {
+    HostSnapshot {
+        has_host: hb.has_host(),
+        frames_in: hb.frames_in(),
+        crc_errs: hb.crc_errs(),
+        seq_errs: hb.seq_errs(),
+        host_wdog: hb.host_wdog(),
+        stall: hb.stall_cycles(),
+        teensy_wdog: hb.teensy_wdog(),
+        motion_active: hb.motion_active(),
+        motion_depth: hb.motion_depth(),
+        motion_underrun: hb.motion_underrun(),
+    }
+}
+
+/// Format the host-bridge diagnostics (outside the lock) for the `host` command.
+fn host_lines(s: HostSnapshot) -> RespLines {
+    let mut lines = RespLines::new();
+    let mut l: heapless::String<96> = heapless::String::new();
+    let _ = write!(
+        l,
+        "[host] link={} frames={} crc_err={} seq_err={}",
+        if s.has_host { "on" } else { "off" },
+        s.frames_in,
+        s.crc_errs,
+        s.seq_errs
+    );
+    let _ = lines.push(l);
+    let mut l: heapless::String<96> = heapless::String::new();
+    let _ = write!(
+        l,
+        "[host] host_wdog={} stall={} teensy_wdog={}",
+        s.host_wdog, s.stall, s.teensy_wdog
+    );
+    let _ = lines.push(l);
+    let mut l: heapless::String<96> = heapless::String::new();
+    let _ = write!(
+        l,
+        "[host] motion active={} depth={} underrun={}",
+        s.motion_active as u8, s.motion_depth, s.motion_underrun as u8
+    );
+    let _ = lines.push(l);
+    let mut l: heapless::String<96> = heapless::String::new();
+    let _ = write!(
+        l,
+        "[host] frame mosi={} miso={} len={}",
+        hal::host_bridge::MOSI_LEN,
+        hal::host_bridge::MISO_LEN,
+        FRAME_LEN
+    );
+    let _ = lines.push(l);
+    lines
+}
+
 unsafe fn init_usb(peripherals: impl imxrt_usbd::Peripherals) {
     let bus = imxrt_usbd::BusAdapter::without_critical_sections(
         peripherals,
@@ -316,6 +415,11 @@ fn serial_try_banner_line(serial: &mut UsbSerial, line: u8) -> bool {
 /// Idle poll cadence (ms) when no command is queued. Kept small so a freshly
 /// typed command is picked up by the worker almost immediately.
 const ECAT_IDLE_MS: u32 = 1;
+
+/// Auto-emit cadence (ms) for `monitor` mode: one compact telemetry line per
+/// period while the cyclic engine runs. ~500 ms is slow enough to never crowd
+/// the command channel, fast enough to watch rate/wkc/jitter/DC live.
+const MON_PERIOD_MS: u32 = 500;
 
 /// Cooperative yield: re-poll on the very next executor pass instead of sleeping
 /// a whole monotonic tick between datagrams. RTIC's generated waker sets the
@@ -419,6 +523,66 @@ async fn ecat_drive<M: Mutex<T = EcatMasterCell>>(
     }
 }
 
+/// Publish one line to the host immediately and wait (bounded) until `usb_isr`
+/// has drained it, so streamed lines don't overwrite each other mid-flush. With
+/// no host attached the drain never completes, so the wait is capped.
+async fn emit_line<O: Mutex<T = EcatOut>>(out: &mut O, line: &str) {
+    out.lock(|o| o.load_line(line));
+    cortex_m::peripheral::NVIC::pend(teensy4_bsp::Interrupt::USB_OTG1);
+    for _ in 0..100 {
+        if !out.lock(|o| o.pending()) {
+            break;
+        }
+        Mono::delay(2_u32.millis()).await;
+    }
+}
+
+/// Drive a bus rescan while streaming each scan sub-step's trace line over
+/// serial as it completes. Unlike the batch `ecat_run_command` path, progress
+/// is visible line-by-line, so a step that faults the firmware still leaves its
+/// predecessors on the host's console -- our primary no-SWD scan diagnostic.
+async fn run_rescan_traced<M, O>(master: &mut M, out: &mut O)
+where
+    M: Mutex<T = EcatMasterCell>,
+    O: Mutex<T = EcatOut>,
+{
+    if master.lock(|m| m.0.cyclic_active()) {
+        emit_line(out, "[ecat] cyclic active; 'stop' before bus commands").await;
+        return;
+    }
+    if let Err(e) = master.lock(|m| m.0.begin(Request::Rescan)) {
+        let mut s: heapless::String<96> = heapless::String::new();
+        let _ = write!(s, "[ecat] error: {}", ecat_err_text(e));
+        emit_line(out, s.as_str()).await;
+        return;
+    }
+    loop {
+        let (res, trace) = master.lock(|m| (m.0.poll_op(), m.0.take_scan_trace()));
+        if let Some(line) = trace {
+            emit_line(out, line.as_str()).await;
+        }
+        match res {
+            None => yield_now().await,
+            Some(result) => {
+                let mut s: heapless::String<96> = heapless::String::new();
+                match result {
+                    Ok(Outcome::Rescanned(n)) => {
+                        let _ = write!(s, "[ecat] rescan complete: {} slave(s); type 'slaves'", n);
+                    }
+                    Ok(_) => {
+                        let _ = write!(s, "[ecat] unexpected outcome");
+                    }
+                    Err(e) => {
+                        let _ = write!(s, "[ecat] error: {}", ecat_err_text(e));
+                    }
+                }
+                emit_line(out, s.as_str()).await;
+                return;
+            }
+        }
+    }
+}
+
 fn reject_busy(out: &mut RespLines) {
     resp_push(out, format_args!("[ecat] cyclic active; 'stop' before bus commands"));
 }
@@ -509,6 +673,137 @@ fn ecat_pd<M: Mutex<T = EcatMasterCell>>(
     }
 }
 
+/// Handle the `stats` command: report the cyclic engine's configured rate,
+/// cycle/working-counter health, tick jitter, and DC sync error. One item per
+/// line so the parent can scrape it while sweeping rates from 100 Hz to 4 kHz.
+fn ecat_stats<M: Mutex<T = EcatMasterCell>>(master: &mut M, out: &mut RespLines) {
+    match master.lock(|m| m.0.cyclic_status()) {
+        None => resp_push(out, format_args!("[ecat] cyclic not running")),
+        Some(st) => {
+            resp_push(
+                out,
+                format_args!(
+                    "[ecat] cyclic {} rate={}Hz period={}us cycles={}",
+                    cyclic_phase_name(st.phase),
+                    st.rate_hz,
+                    st.period_us,
+                    st.cycles
+                ),
+            );
+            resp_push(out, format_args!("[ecat] wkc={}/{}", st.wkc, st.expected_wkc));
+            resp_push(
+                out,
+                format_args!(
+                    "[ecat] jitter min={}us max={}us worst={}us ({} cyc)",
+                    st.jitter_min_us, st.jitter_max_us, st.jitter_worst_us, st.jitter_worst_cyc
+                ),
+            );
+            if st.dc_valid {
+                resp_push(
+                    out,
+                    format_args!(
+                        "[ecat] dc-sync latest={}ns max={}ns",
+                        st.dc_diff_ns, st.dc_diff_max_ns
+                    ),
+                );
+            } else {
+                resp_push(out, format_args!("[ecat] dc-sync n/a (no reading yet)"));
+            }
+        }
+    }
+}
+
+/// Compact single-line cyclic telemetry for `monitor` auto-emit, e.g.
+/// `[mon] 4000Hz cyc=12345 wkc=3/3 jit=0us dc=0ns`. Reuses the same
+/// `CyclicStatus` snapshot the `stats` command formats, kept to one line so a
+/// passive `view_teensy_serial.py` viewer can scroll it live.
+fn mon_line(st: &CyclicStatus) -> heapless::String<96> {
+    let mut s: heapless::String<96> = heapless::String::new();
+    let _ = write!(
+        s,
+        "[mon] {}Hz cyc={} wkc={}/{} jit={}us dc={}ns",
+        st.rate_hz, st.cycles, st.wkc, st.expected_wkc, st.jitter_worst_us, st.dc_diff_ns
+    );
+    s
+}
+
+/// Periodic `monitor` emit, driven by the prio-1 worker's idle loop. Snapshots
+/// the cyclic status under the master lock (the same brief copy `stats` does --
+/// no extra lock hold, nothing added to the prio-3 cyclic tick), then publishes
+/// one line over the shared `ecat_out` path -- but only when that channel is
+/// idle, so it never clobbers a command reply mid-flush. Emitting is independent
+/// of who's connected: `usb_isr` ships it when a host is attached, else it waits
+/// there harmlessly. `running` makes exactly one "stopped" line print when the
+/// engine halts, then stays quiet until it restarts.
+fn maybe_emit_monitor<M, O>(master: &mut M, out: &mut O, running: &mut bool)
+where
+    M: Mutex<T = EcatMasterCell>,
+    O: Mutex<T = EcatOut>,
+{
+    let st = master.lock(|m| m.0.cyclic_status());
+    let mut line: heapless::String<96> = heapless::String::new();
+    let stopping = match st {
+        Some(st) => {
+            *running = true;
+            line = mon_line(&st);
+            false
+        }
+        None => {
+            if !*running {
+                return; // engine stopped and already announced; stay silent
+            }
+            let _ = line.push_str("[mon] cyclic stopped");
+            true
+        }
+    };
+    // Publish only when the channel is idle so we never clobber a reply. The
+    // one-shot "stopped" line keeps `running` set until it actually goes out,
+    // so a momentarily busy channel just defers it instead of dropping it.
+    let emitted = out.lock(|o| {
+        if o.pending() {
+            false
+        } else {
+            o.load_line(line.as_str());
+            true
+        }
+    });
+    if emitted {
+        if stopping {
+            *running = false;
+        }
+        cortex_m::peripheral::NVIC::pend(teensy4_bsp::Interrupt::USB_OTG1);
+    }
+}
+
+/// Read the persisted `CRASHLOG` on demand (if `magic` matches) and append the
+/// formatted `[crash] ...` lines to a command response. Non-destructive: the
+/// record persists until `crashclear`, so a saved crash can be re-read. This is
+/// the only reader of `CRASHLOG` outside the fault handlers, and it never runs
+/// on the boot/init path.
+fn ecat_crashlog(out: &mut RespLines) {
+    let mut report: CrashReport = heapless::Vec::new();
+    // SAFETY: CRASHLOG lives in `.uninit`; every field is a plain integer. We
+    // read `magic` first and only snapshot the record when it matches. The
+    // fault handlers that write it run only on a crash, above this task.
+    let have = unsafe {
+        let p = CRASHLOG.as_mut_ptr();
+        if addr_of!((*p).magic).read_volatile() == CRASHLOG_MAGIC {
+            let log = core::ptr::read(p);
+            fmt_crash_report(&mut report, &log);
+            true
+        } else {
+            false
+        }
+    };
+    if have {
+        for line in &report {
+            resp_push(out, format_args!("{}", line.as_str()));
+        }
+    } else {
+        resp_push(out, format_args!("[crash] none recorded"));
+    }
+}
+
 /// Execute one parsed serial command, returning the response lines.
 async fn ecat_run_command<M: Mutex<T = EcatMasterCell>>(
     master: &mut M,
@@ -519,6 +814,11 @@ async fn ecat_run_command<M: Mutex<T = EcatMasterCell>>(
     let busy = master.lock(|m| m.0.cyclic_active());
     match cmd {
         cli::Command::Empty => {}
+        // `host` and `monitor` are served by the worker directly (they read the
+        // host bridge / toggle worker-local streaming state, not a master op);
+        // these arms are unreachable but keep the match exhaustive.
+        cli::Command::Host => {}
+        cli::Command::Monitor(_) => {}
         cli::Command::Help => {
             for line in cli::HELP {
                 resp_push(&mut out, format_args!("{}", line));
@@ -540,8 +840,9 @@ async fn ecat_run_command<M: Mutex<T = EcatMasterCell>>(
                 resp_push(
                     &mut out,
                     format_args!(
-                        "[ecat] cyclic {} wkc={}/{} cycles={}",
+                        "[ecat] cyclic {} {}Hz wkc={}/{} cycles={} ('stats' for detail)",
                         cyclic_phase_name(st.phase),
+                        st.rate_hz,
                         st.wkc,
                         st.expected_wkc,
                         st.cycles
@@ -616,24 +917,37 @@ async fn ecat_run_command<M: Mutex<T = EcatMasterCell>>(
         cli::Command::Start { .. } if busy => {
             resp_push(&mut out, format_args!("[ecat] cyclic already running; 'stop' first"))
         }
-        cli::Command::Start { slave } => match ecat_drive(master, Request::StartCyclic { slave }).await {
-            Ok(Outcome::CyclicStarted) => {
-                // Configure + start the PIT only now (deliberate action), not at boot.
-                board::cycle_timer::configure(ethercat::config::generated::BUS.cycle_ns);
-                board::cycle_timer::start();
-                resp_push(
-                    &mut out,
-                    format_args!("[ecat] slave {} configured; cyclic PDO started", slave),
-                );
+        cli::Command::Start { slave, rate_hz } => {
+            // Resolve the requested rate to a cyclic period: an explicit `-r<hz>`
+            // overrides the compile-time configured period.
+            let cycle_ns = match rate_hz {
+                Some(hz) => 1_000_000_000u64 / hz as u64,
+                None => ethercat::config::generated::BUS.cycle_ns,
+            };
+            match ecat_drive(master, Request::StartCyclic { slave, cycle_ns }).await {
+                Ok(Outcome::CyclicStarted) => {
+                    // Configure + start the PIT only now (deliberate action), not at boot.
+                    let load = board::cycle_timer::configure(cycle_ns);
+                    board::cycle_timer::start();
+                    resp_push(
+                        &mut out,
+                        format_args!(
+                            "[ecat] slave {} configured; cyclic PDO started at {} Hz",
+                            slave,
+                            board::cycle_timer::actual_hz(load)
+                        ),
+                    );
+                }
+                Ok(_) => resp_push(&mut out, format_args!("[ecat] unexpected outcome")),
+                Err(e) => resp_push(&mut out, format_args!("[ecat] error: {}", ecat_err_text(e))),
             }
-            Ok(_) => resp_push(&mut out, format_args!("[ecat] unexpected outcome")),
-            Err(e) => resp_push(&mut out, format_args!("[ecat] error: {}", ecat_err_text(e))),
-        },
+        }
         cli::Command::Stop => {
             board::cycle_timer::stop();
             let _ = ecat_drive(master, Request::StopCyclic).await;
             resp_push(&mut out, format_args!("[ecat] cyclic PDO stopped"));
         }
+        cli::Command::Stats => ecat_stats(master, &mut out),
         cli::Command::Pdos => {
             resp_push(&mut out, format_args!("[ecat] {} process-data pins:", pdi::all().len()));
             for p in pdi::all() {
@@ -651,6 +965,18 @@ async fn ecat_run_command<M: Mutex<T = EcatMasterCell>>(
             }
         }
         cli::Command::Pd { pin, value } => ecat_pd(master, &mut out, pin, value),
+        cli::Command::Crashlog => ecat_crashlog(&mut out),
+        cli::Command::Crashclear => {
+            // SAFETY: CRASHLOG is plain integers in `.uninit`; clearing `magic`
+            // on demand from the worker can't race the fault handlers, which run
+            // only on a crash (above this task) and fully rewrite the record.
+            unsafe {
+                let p = CRASHLOG.as_mut_ptr();
+                addr_of_mut!((*p).magic).write_volatile(0);
+                cortex_m::asm::dsb();
+            }
+            resp_push(&mut out, format_args!("[crash] cleared"));
+        }
     }
     out
 }
@@ -677,6 +1003,12 @@ impl<T> Singleton<T> {
     unsafe fn assume_init_mut(&self) -> &mut T {
         (*self.value.get()).assume_init_mut()
     }
+
+    /// Raw pointer to the (possibly uninitialized) storage, for field-by-field
+    /// writes from a minimal-stack fault handler that must not build a `&mut T`.
+    unsafe fn as_mut_ptr(&self) -> *mut T {
+        (*self.value.get()).as_mut_ptr()
+    }
 }
 
 /// Show a boot-progress code on the 3 LEDs (indicator=pin13 as bit2,
@@ -695,6 +1027,250 @@ fn boot_stage(
     cortex_m::asm::delay(board::clock_config::CORE_CLOCK_HZ / 3); // ~330 ms
 }
 
+/// Build a `FastGpioOutput` for a board LED without panicking on an unmapped
+/// pin -- a panic/fault handler must never re-panic. The IOMUXC mux + GDIR were
+/// set during `init`; we re-`init` defensively in case the fault preceded that.
+fn fault_led(teensy_pin: u8) -> Option<FastGpioOutput> {
+    let gpio = teensy_pin_to_fast_gpio(BOARD, teensy_pin)?;
+    let out = FastGpioOutput::new(gpio);
+    unsafe { out.init() };
+    Some(out)
+}
+
+/// Crash fallback signal on the indicator LED (pin 13 -- the only LED on the
+/// RMII board): repeat `class` long pulses, then `count` short pulses, then a
+/// pause, forever.
+///
+/// The `panic` handler parks here (class 1) after saving the message, so a
+/// boot-time panic halts on a readable LED code instead of reboot-looping (the
+/// `HardFault` handler instead persists a `CrashLog` and reboots for USB
+/// recovery). The saved context is retrievable on demand via `crashlog`.
+fn blink_diag(class: u8, count: u8) -> ! {
+    let hz = board::clock_config::CORE_CLOCK_HZ;
+    let mut ind = fault_led(LED_INDICATOR_TEENSY_PIN);
+    loop {
+        for _ in 0..class {
+            if let Some(o) = ind.as_mut() {
+                o.set();
+            }
+            cortex_m::asm::delay(hz * 6 / 10); // ~0.6 s long pulse
+            if let Some(o) = ind.as_mut() {
+                o.clear();
+            }
+            cortex_m::asm::delay(hz * 3 / 10);
+        }
+        cortex_m::asm::delay(hz * 4 / 10); // separator before the count
+        for _ in 0..count {
+            if let Some(o) = ind.as_mut() {
+                o.set();
+            }
+            cortex_m::asm::delay(hz / 8); // ~0.12 s short pulse
+            if let Some(o) = ind.as_mut() {
+                o.clear();
+            }
+            cortex_m::asm::delay(hz / 5);
+        }
+        cortex_m::asm::delay(hz * 2); // ~2 s gap before repeating
+    }
+}
+
+/// DTCM addresses below this mark the main stack as nearly exhausted: it grows
+/// down from `_stack_start` = 0x2000_4000 toward the bottom of DTCM at
+/// 0x2000_0000. A faulting SP, exception-frame pointer, or BFAR under the guard
+/// is the signature of a stack overflow.
+const FAULT_STACK_GUARD: u32 = 0x2000_0400;
+/// Marks a valid `CrashLog` left in non-zeroed RAM by a fault/panic handler.
+const CRASHLOG_MAGIC: u32 = 0xC0FF_EE00;
+const CRASH_KIND_HARDFAULT: u32 = 1;
+const CRASH_KIND_PANIC: u32 = 2;
+/// Bytes reserved for a panic message/location captured into the crash log.
+const CRASH_MSG_CAP: usize = 96;
+
+/// Fault/panic context persisted across a soft reset.
+///
+/// Lives in the `.uninit` section (NOLOAD; never cleared by startup), so a
+/// handler can record the crash, `sys_reset()`, and let the next boot replay it
+/// over USB -- far more reliable than keeping the faulting USB device alive,
+/// which the host drops and will not re-enumerate from fault context. `magic`
+/// gates validity and is cleared once the context is latched for printing. All
+/// fields are plain integers, so any residual RAM bit pattern reads as a valid
+/// value.
+#[repr(C)]
+struct CrashLog {
+    magic: u32,
+    kind: u32,
+    pc: u32,
+    lr: u32,
+    sp_frame: u32,
+    msp: u32,
+    r0: u32,
+    r1: u32,
+    r2: u32,
+    r3: u32,
+    r12: u32,
+    xpsr: u32,
+    cfsr: u32,
+    hfsr: u32,
+    bfar: u32,
+    mmfar: u32,
+    msg_len: u32,
+    msg: [u8; CRASH_MSG_CAP],
+}
+
+/// Persisted crash record. `#[link_section = ".uninit.CRASHLOG"]` keeps it out
+/// of `.bss` (which the runtime zeroes), so its contents survive the soft reset.
+#[link_section = ".uninit.CRASHLOG"]
+static CRASHLOG: Singleton<CrashLog> = Singleton::uninit();
+
+/// Max lines in a formatted crash report (HardFault: 4 register lines + a hint).
+/// Lines are kept <= 96 chars so they pass losslessly through the command
+/// response buffer (`RespLines`) when surfaced by the `crashlog` command.
+const CRASH_REPORT_LINES: usize = 6;
+type CrashReport = heapless::Vec<heapless::String<96>, CRASH_REPORT_LINES>;
+
+/// `fmt::Write` sink that fills a fixed byte buffer (volatile, overflow dropped).
+/// Lets the panic handler capture the message straight into `CRASHLOG` with no
+/// heap and no large stack buffer.
+struct MsgSink {
+    ptr: *mut u8,
+    cap: usize,
+    len: usize,
+}
+
+impl core::fmt::Write for MsgSink {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        for &b in s.as_bytes() {
+            if self.len >= self.cap {
+                break;
+            }
+            // SAFETY: `ptr..ptr+cap` is the CRASHLOG message buffer; `len < cap`.
+            unsafe { self.ptr.add(self.len).write_volatile(b) };
+            self.len += 1;
+        }
+        Ok(())
+    }
+}
+
+/// Format the persisted crash context into serial lines (all fields in hex).
+/// Every line is kept <= 96 chars (the register dump is split across two lines)
+/// so nothing is truncated when relayed through the command response buffer.
+fn fmt_crash_report(report: &mut CrashReport, log: &CrashLog) {
+    let mut line: heapless::String<96> = heapless::String::new();
+    match log.kind {
+        CRASH_KIND_HARDFAULT => {
+            let _ = write!(
+                line,
+                "[crash] HARDFAULT pc=0x{:08X} lr=0x{:08X} frame_sp=0x{:08X} msp=0x{:08X}",
+                log.pc, log.lr, log.sp_frame, log.msp
+            );
+            let _ = report.push(line);
+            let mut line: heapless::String<96> = heapless::String::new();
+            let _ = write!(
+                line,
+                "[crash] cfsr=0x{:08X} hfsr=0x{:08X} bfar=0x{:08X} mmfar=0x{:08X}",
+                log.cfsr, log.hfsr, log.bfar, log.mmfar
+            );
+            let _ = report.push(line);
+            let mut line: heapless::String<96> = heapless::String::new();
+            let _ = write!(
+                line,
+                "[crash] r0=0x{:08X} r1=0x{:08X} r2=0x{:08X} r3=0x{:08X}",
+                log.r0, log.r1, log.r2, log.r3
+            );
+            let _ = report.push(line);
+            let mut line: heapless::String<96> = heapless::String::new();
+            let _ = write!(
+                line,
+                "[crash] r12=0x{:08X} xpsr=0x{:08X}",
+                log.r12, log.xpsr
+            );
+            let _ = report.push(line);
+            if log.sp_frame < FAULT_STACK_GUARD
+                || log.msp < FAULT_STACK_GUARD
+                || (log.bfar != 0 && log.bfar < FAULT_STACK_GUARD)
+            {
+                let mut line: heapless::String<96> = heapless::String::new();
+                let _ = write!(
+                    line,
+                    "[crash] hint: SP/frame/BFAR below 0x{:08X}; suspect stack overflow",
+                    FAULT_STACK_GUARD
+                );
+                let _ = report.push(line);
+            }
+        }
+        CRASH_KIND_PANIC => {
+            let _ = line.push_str("[crash] PANIC ");
+            let n = (log.msg_len as usize).min(CRASH_MSG_CAP);
+            for &b in &log.msg[..n] {
+                let c = if (0x20..=0x7E).contains(&b) { b as char } else { '.' };
+                let _ = line.push(c);
+            }
+            let _ = report.push(line);
+        }
+        _ => {
+            let _ = write!(line, "[crash] UNKNOWN kind=0x{:08X}", log.kind);
+            let _ = report.push(line);
+        }
+    }
+}
+
+/// Rust panic: record the message/location into `CRASHLOG`, then park on the
+/// panic LED code (class 1) and HALT. Deliberately does NOT `sys_reset()`: a
+/// panic on the boot/init path would otherwise become an infinite no-USB reboot
+/// loop (the regression this build fixes). A panic is rare at runtime and a halt
+/// is the strictly safer failure mode; the saved message is retrievable on
+/// demand via the `crashlog` command after a manual reboot.
+#[panic_handler]
+fn panic(info: &PanicInfo) -> ! {
+    // SAFETY: a panic runs above every task with exclusive access; CRASHLOG is
+    // plain integers in `.uninit`. We only store, never read uninitialized data.
+    unsafe {
+        let p = CRASHLOG.as_mut_ptr();
+        addr_of_mut!((*p).magic).write_volatile(CRASHLOG_MAGIC);
+        addr_of_mut!((*p).kind).write_volatile(CRASH_KIND_PANIC);
+        let mut sink = MsgSink {
+            ptr: addr_of_mut!((*p).msg) as *mut u8,
+            cap: CRASH_MSG_CAP,
+            len: 0,
+        };
+        let _ = write!(sink, "{}", info);
+        addr_of_mut!((*p).msg_len).write_volatile(sink.len as u32);
+        cortex_m::asm::dsb();
+    }
+    // HALT on the panic LED code (1 long pulse). Never reset here.
+    blink_diag(1, 0)
+}
+
+/// CPU fault (bus/usage/alignment/stacking): record the stacked exception
+/// context and SCB fault-status registers into `CRASHLOG`, then reboot so the
+/// dump is replayed over USB on the next boot. Kept minimal-stack (field stores
+/// + reset; no formatting, no large locals) because the fault may itself be a
+/// stack overflow.
+#[exception]
+unsafe fn HardFault(frame: &ExceptionFrame) -> ! {
+    let scb = &*cortex_m::peripheral::SCB::PTR;
+    let p = CRASHLOG.as_mut_ptr();
+    addr_of_mut!((*p).magic).write_volatile(CRASHLOG_MAGIC);
+    addr_of_mut!((*p).kind).write_volatile(CRASH_KIND_HARDFAULT);
+    addr_of_mut!((*p).pc).write_volatile(frame.pc());
+    addr_of_mut!((*p).lr).write_volatile(frame.lr());
+    addr_of_mut!((*p).sp_frame).write_volatile(frame as *const ExceptionFrame as u32);
+    addr_of_mut!((*p).msp).write_volatile(cortex_m::register::msp::read());
+    addr_of_mut!((*p).r0).write_volatile(frame.r0());
+    addr_of_mut!((*p).r1).write_volatile(frame.r1());
+    addr_of_mut!((*p).r2).write_volatile(frame.r2());
+    addr_of_mut!((*p).r3).write_volatile(frame.r3());
+    addr_of_mut!((*p).r12).write_volatile(frame.r12());
+    addr_of_mut!((*p).xpsr).write_volatile(frame.xpsr());
+    addr_of_mut!((*p).cfsr).write_volatile(scb.cfsr.read());
+    addr_of_mut!((*p).hfsr).write_volatile(scb.hfsr.read());
+    addr_of_mut!((*p).bfar).write_volatile(scb.bfar.read());
+    addr_of_mut!((*p).mmfar).write_volatile(scb.mmfar.read());
+    addr_of_mut!((*p).msg_len).write_volatile(0);
+    cortex_m::asm::dsb();
+    cortex_m::peripheral::SCB::sys_reset()
+}
+
 #[rtic::app(device = teensy4_bsp, dispatchers = [GPIO6_7_8_9, LPUART8, GPT1])]
 mod app {
     use super::*;
@@ -707,6 +1283,10 @@ mod app {
         // Owned by the worker (prio 1) and the cyclic PIT task (prio 3); the
         // PIT task is the highest-priority user, so its lock never blocks.
         ecat_master: EcatMasterCell,
+        // Host-bridge staging, shared by the prio-2 LPSPI task and the prio-3
+        // cyclic task. The SPI task only moves bytes here; it never locks the
+        // master, so the cyclic task's master lock still never blocks.
+        host_bridge: HostBridge,
     }
 
     #[local]
@@ -718,6 +1298,8 @@ mod app {
         led_a: FastGpioOutput,
         led_b: FastGpioOutput,
         ecat_line: heapless::String<128>,
+        host_spi: HostSpiCell,
+        frame_ready: FastGpioOutput,
     }
 
     #[init]
@@ -788,6 +1370,26 @@ mod app {
         boot_stage(&mut indicator, &mut led_a, &mut led_b, 6); // master built; init complete
         log::info!("[ecat] ENET initialised; scheduling bus scan");
 
+        // ── Raspberry Pi / LinuxCNC host bridge (LPSPI3 SPI slave) ──
+        // Mux the configurable LPSPI3 pads + the FRAME_READY GPIO, then bring up
+        // the slave transport sized to the generated bridge frame. The LPSPI and
+        // eDMA clock gates are already enabled by `prepare_clocks_and_power`.
+        host_spi::configure_pads(
+            HOST_SPI_SDO_TEENSY_PIN,
+            HOST_SPI_SCK_TEENSY_PIN,
+            HOST_SPI_SDI_TEENSY_PIN,
+            HOST_SPI_CS_TEENSY_PIN,
+        );
+        host_spi::configure_frame_ready_pad(HOST_SPI_FRAME_READY_TEENSY_PIN);
+        let host_spi_dev = HostSpi::new(FRAME_LEN);
+        let frame_ready_gpio = match teensy_pin_to_fast_gpio(BOARD, HOST_SPI_FRAME_READY_TEENSY_PIN)
+        {
+            Some(g) => g,
+            None => panic!("unsupported HOST_SPI_FRAME_READY_PIN"),
+        };
+        let frame_ready = FastGpioOutput::new(frame_ready_gpio);
+        unsafe { frame_ready.init() };
+
         // The PIT cyclic-tick timer is configured lazily by the `start` command.
 
         // After init returns, blink_leds takes over pins 4/5 (alternating
@@ -801,6 +1403,7 @@ mod app {
                 ecat_cmd: None,
                 ecat_out: EcatOut::new(),
                 ecat_master: EcatMasterCell(ecat_master),
+                host_bridge: HostBridge::new(),
             },
             Local {
                 usb_configured: false,
@@ -810,6 +1413,8 @@ mod app {
                 led_a,
                 led_b,
                 ecat_line: heapless::String::new(),
+                host_spi: HostSpiCell(host_spi_dev),
+                frame_ready,
             },
         )
     }
@@ -954,7 +1559,7 @@ mod app {
         }
     }
 
-    #[task(shared = [ecat_scan, ecat_cmd, ecat_out, ecat_master], priority = 1)]
+    #[task(shared = [ecat_scan, ecat_cmd, ecat_out, ecat_master, host_bridge], priority = 1)]
     async fn ethercat_worker(mut cx: ethercat_worker::Context) {
         // Let USB enumerate before touching the (shared) master. The master
         // lock's ceiling is raised to the cyclic PIT task's priority (3), which
@@ -975,17 +1580,78 @@ mod app {
         // first step of `start`), once the operator confirms the network.
         cortex_m::peripheral::NVIC::pend(teensy4_bsp::Interrupt::USB_OTG1);
 
+        // `monitor` streaming state, owned entirely by this task: `monitor_on`
+        // gates auto-emit, `mon_running` tracks the engine for the one-shot
+        // "stopped" line, and `last_mon` paces the cadence. `last_mon` is a raw
+        // monotonic tick count; the 1 kHz `Mono` makes 1 tick == 1 ms, so the
+        // wrapping delta below is the elapsed milliseconds.
+        let mut monitor_on = false;
+        let mut mon_running = false;
+        let mut last_mon = Mono::now().ticks();
+
         // Command loop: take a parsed command, drive it (locking the master per
         // datagram, yielding between), publish the response, and wake USB.
         loop {
             let cmd = cx.shared.ecat_cmd.lock(|slot| slot.take());
             match cmd {
+                // `rescan` streams its progress line-by-line over serial (each
+                // scan sub-step), so it owns the output channel directly rather
+                // than returning a single batched response.
+                Some(cli::Command::Rescan) => {
+                    run_rescan_traced(&mut cx.shared.ecat_master, &mut cx.shared.ecat_out).await;
+                }
+                // `host` reads the host-bridge staging state (shared with the SPI
+                // + cyclic tasks), not the master, so it is served here directly.
+                Some(cli::Command::Host) => {
+                    let snap = cx.shared.host_bridge.lock(host_snapshot);
+                    let lines = host_lines(snap);
+                    cx.shared.ecat_out.lock(|o| o.set_lines(&lines));
+                    cortex_m::peripheral::NVIC::pend(teensy4_bsp::Interrupt::USB_OTG1);
+                }
+                // `monitor on|off` toggles this task's auto-emit; handled here
+                // (not in `ecat_run_command`) because the state is task-local.
+                Some(cli::Command::Monitor(mode)) => {
+                    monitor_on = match mode {
+                        cli::MonitorMode::On => true,
+                        cli::MonitorMode::Off => false,
+                        cli::MonitorMode::Toggle => !monitor_on,
+                    };
+                    // Pace the first auto-line a full period after the ack.
+                    last_mon = Mono::now().ticks();
+                    let mut lines = RespLines::new();
+                    resp_push(
+                        &mut lines,
+                        format_args!(
+                            "[ecat] monitor {} (auto-stats ~{}ms)",
+                            if monitor_on { "on" } else { "off" },
+                            MON_PERIOD_MS
+                        ),
+                    );
+                    cx.shared.ecat_out.lock(|o| o.set_lines(&lines));
+                    cortex_m::peripheral::NVIC::pend(teensy4_bsp::Interrupt::USB_OTG1);
+                }
                 Some(cmd) => {
                     let lines = ecat_run_command(&mut cx.shared.ecat_master, cmd).await;
                     cx.shared.ecat_out.lock(|o| o.set_lines(&lines));
                     cortex_m::peripheral::NVIC::pend(teensy4_bsp::Interrupt::USB_OTG1);
                 }
                 None => Mono::delay(ECAT_IDLE_MS.millis()).await,
+            }
+
+            // While monitoring, auto-emit one compact telemetry line ~every
+            // `MON_PERIOD_MS`, independent of who's connected. Best-effort and
+            // non-blocking: it borrows the master only for the brief status
+            // snapshot `stats` already uses, never the prio-3 cyclic tick.
+            if monitor_on {
+                let now = Mono::now().ticks();
+                if now.wrapping_sub(last_mon) >= MON_PERIOD_MS {
+                    last_mon = now;
+                    maybe_emit_monitor(
+                        &mut cx.shared.ecat_master,
+                        &mut cx.shared.ecat_out,
+                        &mut mon_running,
+                    );
+                }
             }
         }
     }
@@ -994,9 +1660,32 @@ mod app {
     /// device for the duration of one short, non-blocking cycle (process the
     /// previous reply, send this cycle's LRW). Priority above `usb_isr` so the
     /// cycle is not delayed by USB or the worker.
-    #[task(binds = PIT, shared = [ecat_master], priority = 3)]
-    fn cyclic(mut cx: cyclic::Context) {
+    #[task(binds = PIT, shared = [ecat_master, host_bridge], priority = 3)]
+    fn cyclic(cx: cyclic::Context) {
         board::cycle_timer::clear_interrupt();
-        cx.shared.ecat_master.lock(|m| m.0.cyclic_tick());
+        (cx.shared.ecat_master, cx.shared.host_bridge)
+            .lock(|m, host| m.0.host_cycle(host));
+    }
+
+    /// LPSPI3 SPI-slave interrupt: drain the host's transaction. On a completed
+    /// full-duplex frame, hand the inbound bytes to the shared `HostBridge`,
+    /// stage the reply the cyclic task prepared, and re-arm. Priority 2 (above
+    /// the worker, below the cyclic tick); it never touches the EtherCAT master.
+    #[task(binds = LPSPI3, shared = [host_bridge], local = [host_spi, frame_ready], priority = 2)]
+    fn host_spi_task(mut cx: host_spi_task::Context) {
+        let spi = &mut cx.local.host_spi.0;
+        if spi.service() != ServiceEvent::FrameComplete {
+            return;
+        }
+        let mut reply = [0u8; FRAME_LEN];
+        cx.shared.host_bridge.lock(|hb| {
+            hb.ingest(spi.rx_frame());
+            let r = hb.reply();
+            reply[..r.len()].copy_from_slice(r);
+        });
+        spi.set_next_tx(&reply);
+        spi.begin_next_frame();
+        // Strobe FRAME_READY so the host can align its next read / detect stalls.
+        cx.local.frame_ready.toggle();
     }
 }

@@ -7,5 +7,6 @@
 pub mod clock_config;
 pub mod cycle_timer;
 pub mod fast_gpio;
+pub mod host_spi;
 pub mod teensy_pin_map;
 pub mod usb_bootloader;
